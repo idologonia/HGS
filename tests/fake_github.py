@@ -14,6 +14,8 @@ class FakeGitHub:
         self.token = token
         self.files: dict[str, bytes] = {}  # "owner/repo/path" -> content
         self.puts = 0
+        self.stale_gets = 0  # how many GETs return an outdated sha (like GitHub's cache)
+        self._old: dict[str, bytes] = {}
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -40,6 +42,9 @@ class FakeGitHub:
                 if key not in fake.files:
                     return self._send(404, b'{"message":"Not Found"}')
                 data = fake.files[key]
+                if fake.stale_gets > 0 and key in fake._old:
+                    fake.stale_gets -= 1
+                    data = fake._old[key]
                 if "raw" in (self.headers.get("Accept") or ""):
                     return self._send(200, data)
                 sha = hashlib.sha1(data).hexdigest()
@@ -52,9 +57,12 @@ class FakeGitHub:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 if key in fake.files and body.get("sha") != hashlib.sha1(fake.files[key]).hexdigest():
                     return self._send(409, b'{"message":"sha mismatch"}')
+                if key in fake.files:
+                    fake._old[key] = fake.files[key]
                 fake.files[key] = base64.b64decode(body["content"])
                 fake.puts += 1
-                self._send(200, json.dumps({"commit": {"sha": "abc"}}).encode())
+                new_sha = hashlib.sha1(fake.files[key]).hexdigest()
+                self._send(200, json.dumps({"commit": {"sha": "abc"}, "content": {"sha": new_sha}}).encode())
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"

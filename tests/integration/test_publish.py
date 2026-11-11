@@ -61,3 +61,18 @@ async def test_core_stop_publishes_offline(core_factory, github, tmp_path):
     await h.admin.post("/network/publish")
     await h.core.stop()
     assert github.doc(KEY)["online"] is False
+
+
+async def test_stale_github_cache_and_parallel_publishes(hgs, github):
+    await hgs.admin.put("/secrets/github_token", json={"value": "ghp_test"})
+    await net(hgs, mode="tunnel", publish={"enabled": True, "repo": "me/hgs-address"})
+    github.files[KEY] = b'{"online": true, "server": "wss://old"}'
+    github._old[KEY] = b'{"older": 1}'
+    github.stale_gets = 1  # the first read returns an outdated version -> 409 -> re-read -> success
+    hgs.core.network.publisher._sha.clear()
+    r = await hgs.admin.post("/network/publish")
+    assert r.status_code == 200, r.text
+    # the button right after saving: several publishes at once must not conflict
+    results = await asyncio.gather(*(hgs.admin.post("/network/publish") for _ in range(3)))
+    assert all(x.status_code == 200 for x in results), [x.text for x in results]
+    assert (await hgs.admin.get("/network")).json()["publish"]["error"] is None

@@ -56,6 +56,7 @@ class AddressPublisher:
         self.last_published: dict | None = None
         self._lock = asyncio.Lock()
         self._pending: asyncio.Task | None = None
+        self._sha: dict[str, str] = {}  # last known version of the file (GitHub's GET can be cached)
 
     @property
     def cfg(self):
@@ -88,6 +89,8 @@ class AddressPublisher:
                 "updated": int(time.time()), "name": self.core.settings.server_name}
 
     async def publish(self, doc: dict | None = None) -> dict:
+        if self._pending and not self._pending.done() and asyncio.current_task() is not self._pending:
+            self._pending.cancel()  # an explicit publish replaces the scheduled one
         async with self._lock:
             cfg = self.cfg
             if not cfg.repo or not REPO_RE.match(cfg.repo) or not PATH_RE.match(cfg.path):
@@ -97,7 +100,7 @@ class AddressPublisher:
                 raise self._fail("не вказано токен GitHub")
             doc = doc or self._document()
             try:
-                result = await asyncio.to_thread(self._put, cfg.repo, cfg.path, token, doc)
+                result = await asyncio.to_thread(self._put, cfg.repo, cfg.path, token, doc, self._sha)
             except PublishError as exc:
                 raise self._fail(str(exc))
             self.error = None
@@ -118,20 +121,36 @@ class AddressPublisher:
         return PublishError(message)
 
     @staticmethod
-    def _put(repo: str, path: str, token: str, doc: dict) -> str | None:
+    def _put(repo: str, path: str, token: str, doc: dict, known: dict[str, str]) -> str | None:
         url = f"{API}/repos/{repo}/contents/{path}"
-        code, current = _request("GET", url, token)
-        if code not in (200, 404):
-            raise PublishError(_explain(code, current))
-        sha = current.get("sha") if code == 200 and isinstance(current, dict) else None
+        key = f"{repo}/{path}"
         body = {"message": f"HGS: server {'online' if doc['online'] else 'offline'}",
                 "content": base64.b64encode(json.dumps(doc, indent=2).encode()).decode()}
-        if sha:
-            body["sha"] = sha
-        code, res = _request("PUT", url, token, body)
-        if code not in (200, 201):
-            raise PublishError(_explain(code, res))
-        return (res.get("commit") or {}).get("sha") if isinstance(res, dict) else None
+        sha = known.get(key)
+        for attempt in range(4):
+            if sha is None or attempt > 0:
+                # ask for the current version; the query string avoids a cached answer
+                code, current = _request("GET", f"{url}?nocache={time.time_ns()}", token)
+                if code not in (200, 404):
+                    raise PublishError(_explain(code, current))
+                sha = current.get("sha") if code == 200 and isinstance(current, dict) else None
+            if sha:
+                body["sha"] = sha
+            else:
+                body.pop("sha", None)
+            code, res = _request("PUT", url, token, body)
+            if code in (200, 201):
+                new_sha = ((res or {}).get("content") or {}).get("sha") if isinstance(res, dict) else None
+                if new_sha:
+                    known[key] = new_sha
+                else:
+                    known.pop(key, None)
+                return (res.get("commit") or {}).get("sha") if isinstance(res, dict) else None
+            if code not in (409, 422):  # 409/422 = the file changed in between: read it again and retry
+                raise PublishError(_explain(code, res))
+            known.pop(key, None)
+            time.sleep(1.0 + attempt)
+        raise PublishError(_explain(code, res))
 
 
 def _explain(code: int, res: Any) -> str:
