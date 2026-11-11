@@ -9,7 +9,9 @@ import base64
 import hashlib
 import json
 import logging
+import shutil
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -83,3 +85,103 @@ class SaveManager:
             "SELECT reason, path, size_bytes, ok, error, created_at FROM saves WHERE game_id=? ORDER BY id DESC LIMIT ?",
             (game_id, limit),
         )
+
+
+    # == listing ======================================================================
+    def list_snapshots(self, game_id: str) -> list[dict]:
+        out = []
+        for p in reversed(self._snapshots(self.paths.game(game_id).saves)):
+            st = p.stat()
+            out.append({"file": p.name, "size_bytes": st.st_size, "modified": st.st_mtime})
+        return out
+
+    def list_backups(self, game_id: str) -> list[dict]:
+        folder = self.paths.game(game_id).backups
+        if not folder.is_dir():
+            return []
+        return [{"file": p.name, "size_bytes": p.stat().st_size, "modified": p.stat().st_mtime}
+                for p in sorted(folder.glob("*.zip"), reverse=True)]
+
+    @staticmethod
+    def _safe_name(name: str) -> str:
+        if not name or "/" in name or "\\" in name or name.startswith(".") or ".." in name:
+            raise ValueError("invalid file name")
+        return name
+
+    # == backups ======================================================================
+    def make_backup(self, game_id: str, reason: str, keep: int = 10) -> Path:
+        """Zip the game's HGS data (snapshots, game data written by the game, config) — not the backups."""
+        gp = self.paths.game(game_id)
+        gp.backups.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+        target = gp.backups / f"{stamp}_{reason}.zip"
+        tmp = target.with_suffix(".zip.part")
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+            for path in gp.root.rglob("*"):
+                rel = path.relative_to(gp.root)
+                if not path.is_file() or rel.parts[0] in ("backups", "runtime", "logs"):
+                    continue
+                z.write(path, rel.as_posix())
+        tmp.replace(target)
+        backups = sorted(gp.backups.glob("*.zip"))
+        for old in backups[:-keep] if keep > 0 else []:
+            old.unlink(missing_ok=True)
+        log.info("backup of %s created: %s", game_id, target.name)
+        return target
+
+    async def backup(self, game_id: str, reason: str) -> dict:
+        import asyncio
+
+        try:
+            path = await asyncio.to_thread(self.make_backup, game_id, reason)
+        except Exception as exc:
+            await self.db.execute(
+                "INSERT INTO saves(game_id, kind, reason, ok, error, created_at) VALUES (?,?,?,?,?,?)",
+                (game_id, "backup", reason, 0, str(exc), utcnow()))
+            raise
+        data = path.read_bytes()
+        await self.db.execute(
+            "INSERT INTO saves(game_id, kind, reason, path, size_bytes, sha256, ok, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (game_id, "backup", reason, str(path), len(data), hashlib.sha256(data).hexdigest(), 1, utcnow()))
+        return {"file": path.name, "size_bytes": len(data)}
+
+    # == restore ======================================================================
+    async def restore_snapshot(self, game_id: str, file: str) -> dict:
+        """Make the chosen snapshot the newest one; it is loaded on the next start.
+        The current state is backed up first, so a restore can be undone."""
+        gp = self.paths.game(game_id)
+        src = gp.saves / self._safe_name(file)
+        if not src.is_file():
+            raise ValueError("snapshot not found")
+        await self.backup(game_id, "before_restore")
+        stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+        dest = gp.saves / f"{stamp}_restore{src.suffix}"
+        atomic_write_bytes(dest, src.read_bytes())
+        await self._journal(game_id, "restore", str(dest), dest.stat().st_size, None, True, None)
+        return {"file": dest.name}
+
+    async def restore_backup(self, game_id: str, file: str) -> dict:
+        import asyncio
+
+        gp = self.paths.game(game_id)
+        src = gp.backups / self._safe_name(file)
+        if not src.is_file():
+            raise ValueError("backup not found")
+        await self.backup(game_id, "before_restore")
+
+        def _extract() -> None:
+            with zipfile.ZipFile(src) as z:
+                names = z.namelist()
+                for n in names:  # refuse archives that try to escape the folder
+                    target = (gp.root / n).resolve()
+                    if not str(target).startswith(str(gp.root.resolve())) or n.split("/")[0] in ("backups", "runtime"):
+                        raise ValueError(f"unsafe path in backup: {n}")
+                shutil.rmtree(gp.saves, ignore_errors=True)
+                gp.saves.mkdir(parents=True, exist_ok=True)
+                for n in names:
+                    if n != "game.json":  # the configuration is not rolled back, only the data
+                        z.extract(n, gp.root)
+
+        await asyncio.to_thread(_extract)
+        await self._journal(game_id, "restore_backup", str(src), src.stat().st_size, None, True, None)
+        return {"file": file}

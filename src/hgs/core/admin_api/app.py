@@ -39,6 +39,24 @@ class ManifestBody(BaseModel):
     manifest: dict
 
 
+class FileName(BaseModel):
+    file: str = Field(min_length=1, max_length=200)
+
+
+class RoomUpdate(BaseModel):
+    status: str | None = Field(None, pattern="^(open|locked)$")
+    max_players: int | None = Field(None, ge=1, le=1000)
+
+
+class GeneralSettings(BaseModel):
+    server_name: str = Field(min_length=1, max_length=64)
+    max_connections_per_ip: int = Field(ge=1, le=1000)
+    hello_timeout_s: float = Field(gt=0, le=60)
+    log_max_file_mb: int = Field(ge=1, le=1000)
+    log_keep_files: int = Field(ge=1, le=100)
+    metrics_interval_s: float = Field(ge=0.5, le=60)
+
+
 class ProgramPath(BaseModel):
     path: str = Field(min_length=1, max_length=1024)
 
@@ -156,6 +174,68 @@ def create_admin_app(core: "CoreApp") -> FastAPI:
     @app.put(f"{api}/games/{{game_id}}/manifest", dependencies=deps)
     async def put_manifest(game_id: str, body: ManifestBody) -> dict:
         return core.servers.game_view(await core.servers.update_manifest(game_id, body.manifest))
+
+    # -- saves and backups --------------------------------------------------------------
+    @app.get(f"{api}/games/{{game_id}}/saves", dependencies=deps)
+    async def saves(game_id: str) -> dict:
+        core.servers._get(game_id)
+        return {"snapshots": core.saves.list_snapshots(game_id), "backups": core.saves.list_backups(game_id),
+                "journal": await core.saves.history(game_id, 50)}
+
+    @app.post(f"{api}/games/{{game_id}}/save", dependencies=deps)
+    async def save_now(game_id: str) -> dict:
+        g = core.servers._get(game_id)
+        if not core.servers.is_running(game_id):
+            raise GameError("conflict", "the server is not running")
+        result = await g.adapter.save("manual")
+        if result is None:
+            raise GameError("bad_request", "this game does not save its state (or saving is disabled in its settings)")
+        return result
+
+    @app.post(f"{api}/games/{{game_id}}/backup", dependencies=deps)
+    async def backup(game_id: str) -> dict:
+        core.servers._get(game_id)
+        return await core.saves.backup(game_id, "manual")
+
+    def _require_stopped(game_id: str) -> None:
+        g = core.servers._get(game_id)
+        if g.state.value not in ("stopped", "error", "failed"):
+            raise GameError("conflict", "stop the server before restoring")
+
+    @app.post(f"{api}/games/{{game_id}}/restore-snapshot", dependencies=deps)
+    async def restore_snapshot(game_id: str, body: FileName) -> dict:
+        _require_stopped(game_id)
+        return await core.saves.restore_snapshot(game_id, body.file)
+
+    @app.post(f"{api}/games/{{game_id}}/restore-backup", dependencies=deps)
+    async def restore_backup(game_id: str, body: FileName) -> dict:
+        _require_stopped(game_id)
+        return await core.saves.restore_backup(game_id, body.file)
+
+    # -- general settings ---------------------------------------------------------------
+    @app.get(f"{api}/settings", dependencies=deps)
+    async def get_settings() -> dict:
+        st = core.settings
+        return {"server_name": st.server_name, "max_connections_per_ip": st.gateway.max_connections_per_ip,
+                "hello_timeout_s": st.gateway.hello_timeout_s, "log_max_file_mb": st.logs.max_file_mb,
+                "log_keep_files": st.logs.keep_files, "metrics_interval_s": st.resources.metrics_interval_s,
+                "admin_port": st.admin.port, "worker_bus_port": st.worker_bus.port,
+                "allowed_programs": st.allowed_programs, "data_dir": str(core.paths.root),
+                "secrets_protected": core.secrets.protected}
+
+    @app.put(f"{api}/settings", dependencies=deps)
+    async def put_settings(body: GeneralSettings) -> dict:
+        st = core.settings
+        st.server_name = body.server_name
+        st.gateway.max_connections_per_ip = body.max_connections_per_ip
+        st.gateway.hello_timeout_s = body.hello_timeout_s
+        st.logs.max_file_mb = body.log_max_file_mb
+        st.logs.keep_files = body.log_keep_files
+        st.resources.metrics_interval_s = body.metrics_interval_s
+        core.resources.interval_s = body.metrics_interval_s
+        core._save_settings()
+        core.bus.publish("settings.changed")
+        return await get_settings()
 
     # -- allowlist of programs ---------------------------------------------------------
     @app.get(f"{api}/allowlist", dependencies=deps)
@@ -300,6 +380,13 @@ def create_admin_app(core: "CoreApp") -> FastAPI:
         r = game.manifest.rooms
         room = core.rooms.create(body.game_id, body.name, max_players=min(body.max_players or r.max_players, r.max_players),
                                  max_rooms=r.max_rooms, persistent=True, created_by="admin")
+        return room.admin_view()
+
+    @app.post(f"{api}/rooms/{{game_id}}/{{room_id}}/update", dependencies=deps)
+    async def update_room(game_id: str, room_id: str, body: RoomUpdate) -> dict:
+        room = core.rooms.update(game_id, room_id, status=body.status, max_players=body.max_players)
+        if room is None:
+            raise GameError("not_found", "room not found")
         return room.admin_view()
 
     @app.delete(f"{api}/rooms/{{game_id}}/{{room_id}}", dependencies=deps)

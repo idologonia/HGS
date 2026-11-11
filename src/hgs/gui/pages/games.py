@@ -56,7 +56,7 @@ class GameCard(Card):
         grid.setSpacing(6)
         spec = [("start", "Start"), ("stop", "Stop"), ("restart", "Restart"),
                 ("settings", "Settings"), ("logs", "Logs"), ("players", "Players"),
-                ("status", "Status"), ("invite", "Invite"), ("remove", "Видалити")]
+                ("status", "Status"), ("invite", "Invite"), ("saves", "Saves"), ("remove", "Видалити")]
         for i, (key, text) in enumerate(spec):
             b = QPushButton(text)
             if key == "start":
@@ -65,7 +65,7 @@ class GameCard(Card):
                 b.setObjectName("Danger")
             b.clicked.connect(lambda _=False, k=key: self.action.emit(self.game_id, k))
             self.buttons[key] = b
-            grid.addWidget(b, i // 3, i % 3)
+            grid.addWidget(b, i // 4, i % 4)
         lay.addLayout(grid)
         self.update_game(game)
 
@@ -107,9 +107,10 @@ class GameCard(Card):
 class GamesPage(QWidget):
     open_logs = Signal(str)  # log source
 
-    def __init__(self, client: "CoreClient", parent: QWidget | None = None) -> None:
+    def __init__(self, client: "CoreClient", parent: QWidget | None = None, data_dir: str = "") -> None:
         super().__init__(parent)
         self.client = client
+        self.data_dir = data_dir
         self.setObjectName("Page")
         self.cards: dict[str, GameCard] = {}
         root = QVBoxLayout(self)
@@ -254,6 +255,10 @@ class GamesPage(QWidget):
             PlayersDialog(self, self.client, g).exec()
         elif action == "invite":
             InviteDialog(self, self.client, g).exec()
+        elif action == "saves":
+            from hgs.gui.pages.saves import SavesDialog
+
+            SavesDialog(self, self.client, g, self.data_dir).exec()
 
 
 # ======================================================================== dialogs

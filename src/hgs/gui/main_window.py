@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QTimer
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QListWidget, QMainWindow, QMessageBox, QStackedWidget, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QListWidget, QMainWindow, QMenu, QMessageBox, QStackedWidget, QSystemTrayIcon, QVBoxLayout,
+    QWidget,
 )
 
 from hgs import __version__
@@ -17,16 +18,38 @@ from hgs.gui.pages.dashboard import DashboardPage
 from hgs.gui.pages.games import GamesPage
 from hgs.gui.pages.logs import LogsPage
 from hgs.gui.pages.network import NetworkPage
+from hgs.gui.pages.players import PlayersPage
+from hgs.gui.pages.rooms import RoomsPage
+from hgs.gui.pages.settings import SettingsPage, gui_prefs
 from hgs.gui.widgets.common import Banner
 
 # Events after which the game list is re-read (debounced).
 GAME_EVENTS = ("server.state_changed", "game.", "player.", "room.", "network.")
 
 
+def app_icon() -> QIcon:
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setBrush(QColor("#4f8cff"))
+    p.setPen(Qt.NoPen)
+    p.drawRoundedRect(4, 4, 56, 56, 14, 14)
+    p.setPen(QColor("white"))
+    f = QFont()
+    f.setBold(True)
+    f.setPixelSize(30)
+    p.setFont(f)
+    p.drawText(pm.rect(), Qt.AlignCenter, "H")
+    p.end()
+    return QIcon(pm)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, data_dir: Path) -> None:
         super().__init__()
         self.setWindowTitle("HOME GAME SERVER")
+        self.setWindowIcon(app_icon())
         self.resize(1180, 760)
         self.data_dir = data_dir
         self._quitting = False
@@ -81,12 +104,17 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.dashboard = DashboardPage()
-        self.games = GamesPage(self.client)
-        self.logs = LogsPage(self.client, str(data_dir / "logs"))
+        self.games = GamesPage(self.client, data_dir=str(data_dir))
+        self.players = PlayersPage(self.client)
+        self.rooms = RoomsPage(self.client)
         self.network = NetworkPage(self.client)
+        self.logs = LogsPage(self.client, str(data_dir / "logs"))
+        self.settings_page = SettingsPage(self.client)
         self.games.open_logs.connect(self.show_logs)
-        for name, page in (("Dashboard", self.dashboard), ("Games", self.games), ("Network", self.network),
-                           ("Logs", self.logs)):
+        self.pages = (("Dashboard", self.dashboard), ("Games", self.games), ("Players", self.players),
+                      ("Rooms", self.rooms), ("Network", self.network), ("Logs", self.logs),
+                      ("Settings", self.settings_page))
+        for name, page in self.pages:
             self.nav.addItem(name)
             self.stack.addWidget(page)
         self.nav.currentRowChanged.connect(self._on_nav)
@@ -102,6 +130,23 @@ class MainWindow(QMainWindow):
         self._uptime = QTimer(self)  # keeps uptime counters fresh
         self._uptime.setInterval(5000)
         self._uptime.timeout.connect(self._refresh_all)
+
+        self.tray: QSystemTrayIcon | None = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray = QSystemTrayIcon(app_icon(), self)
+            self.tray.setToolTip("HOME GAME SERVER")
+            menu = QMenu(self)
+            show = QAction("Показати", self)
+            show.triggered.connect(self.show_from_tray)
+            quit_ = QAction("Вийти", self)
+            quit_.triggered.connect(self.quit_from_tray)
+            menu.addAction(show)
+            menu.addAction(quit_)
+            self.tray.setContextMenu(menu)
+            self.tray.activated.connect(lambda reason: self.show_from_tray()
+                                        if reason == QSystemTrayIcon.Trigger else None)
+            self.tray.show()
+        self._force_quit = False
 
         self.launcher.start()
 
@@ -170,8 +215,10 @@ class MainWindow(QMainWindow):
             return
         self.games.refresh()
         self.client.call("GET", "/status", None, self._on_status)
-        if self.stack.currentWidget() is self.network:
-            self.network.refresh()
+        self.client.call("GET", "/games", None, lambda ok, d: ok and self.dashboard.update_games(d))
+        current = self.stack.currentWidget()
+        if current in (self.network, self.players, self.rooms):
+            current.refresh()
 
     def _on_status(self, ok: bool, st) -> None:
         if not ok:
@@ -187,20 +234,39 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(row)
         if self.stack.currentWidget() is self.logs and self._core_ready and self.logs.source.count() == 0:
             self.logs.load_sources()
-        if self.stack.currentWidget() is self.network and self._core_ready:
-            self.network.refresh()
+        if self.stack.currentWidget() in (self.network, self.players, self.rooms, self.settings_page) and self._core_ready:
+            self.stack.currentWidget().refresh()
 
     def show_logs(self, source: str) -> None:
         self.nav.setCurrentRow(self.stack.indexOf(self.logs))
         self.logs.show_source(source)
 
     # -- closing --------------------------------------------------------------------
+    def show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_from_tray(self) -> None:
+        self._force_quit = True
+        self.show_from_tray()
+        self.close()
+
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         if not self.launcher.is_running():
+            if self.tray:
+                self.tray.hide()
             event.accept()
             return
+        running = [c.game["name"] for c in self.games.cards.values() if c.game["state"] == "running"]
+        if (running and not self._quitting and not self._force_quit and self.tray is not None
+                and gui_prefs().value("minimize_to_tray", True, type=bool)):
+            self.hide()
+            self.tray.showMessage("HOME GAME SERVER", "Сервери працюють далі. Вийти можна з меню значка в треї.",
+                                  QSystemTrayIcon.Information, 4000)
+            event.ignore()
+            return
         if not self._quitting:
-            running = [c.game["name"] for c in self.games.cards.values() if c.game["state"] == "running"]
             if running:
                 players = sum(c.game["players_online"] for c in self.games.cards.values())
                 answer = QMessageBox.question(

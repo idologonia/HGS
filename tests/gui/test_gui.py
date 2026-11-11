@@ -68,6 +68,7 @@ def window(qapp, tmp_path, monkeypatch):
     w.show()
     wait_until(qapp, lambda: w._core_ready and w.client.events_connected, what="core ready")
     yield w
+    w._force_quit = True  # do not minimize to the tray (real desktops in CI have one)
     w.close()  # goes through the normal exit path (confirmation auto-accepted)
     wait_until(qapp, lambda: not w.launcher.is_running(), timeout=20, what="core stop")
     w.deleteLater()
@@ -123,7 +124,8 @@ def test_full_flow_add_start_player_stop(qapp, window, tmp_path):
         w.nav.setCurrentRow(1)
         card.buttons["start"].click()
         wait_until(qapp, lambda: card.game["state"] == "running", what="running again")
-        for i, name in ((0, "dashboard"), (1, "games"), (2, "network"), (3, "logs")):
+        for i, (name, _page) in enumerate(w.pages):
+            name = name.lower()
             w.nav.setCurrentRow(i)
             for _ in range(30):
                 qapp.processEvents()
@@ -258,3 +260,88 @@ def test_add_python_project_without_manifest_and_edit_settings(qapp, window, tmp
     sd.save.click()
     assert "некоректний JSON" in sd.msg.text()
     sd.close()
+
+
+def _connect_player(port: int, game: str, name: str, room: str = "lobby"):
+    from websockets.sync.client import connect
+
+    ws = connect(f"ws://127.0.0.1:{port}/hgs/v1/ws").__enter__()
+    ws.send(json.dumps({"v": 1, "t": "hello", "seq": 1, "d": {"game": game, "auth": {"type": "open", "name": name}}}))
+    ws.recv()
+    ws.send(json.dumps({"v": 1, "t": "room.join", "seq": 2, "id": "j", "d": {"room_id": room}}))
+    return ws
+
+
+def test_players_rooms_settings_and_saves_pages(qapp, window, tmp_path):
+    from hgs.gui.pages.saves import SavesDialog
+    from hgs.gui.widgets.table import selected_key
+
+    w = window
+    root = __import__("pathlib").Path(__file__).resolve().parents[2] / "examples" / "demo-arena" / "logic"
+    w.client.call("POST", "/games", {"path": str(root)})
+    wait_until(qapp, lambda: "demo-arena-logic" in w.games.cards, what="card")
+    card = w.games.cards["demo-arena-logic"]
+    card.buttons["start"].click()
+    wait_until(qapp, lambda: card.game["state"] == "running", what="running")
+    ann = _connect_player(w.launcher.gateway_port, "demo-arena-logic", "Ann")
+
+    # Dashboard: per-game resources
+    wait_until(qapp, lambda: w.dashboard.servers_table.rowCount() == 1
+               and w.dashboard.servers_table.item(0, 2).text() == "1", what="dashboard servers table")
+    assert w.dashboard.servers_table.item(0, 5).text() != "—"  # worker RAM is measured
+
+    # Rooms: create, lock, close
+    w.nav.setCurrentRow(w.stack.indexOf(w.rooms))
+    wait_until(qapp, lambda: w.rooms.table.rowCount() == 1, what="lobby listed")
+    w.client.call("POST", "/rooms", {"game_id": "demo-arena-logic", "name": "Arena 2", "max_players": 4})
+    wait_until(qapp, lambda: w.rooms.table.rowCount() == 2, what="new room listed")
+    row = next(r for r in range(2) if w.rooms.table.item(r, 0).text() == "Arena 2")
+    w.rooms.table.selectRow(row)
+    w.rooms.lock_btn.click()
+    wait_until(qapp, lambda: any(r["status"] == "locked" for r in w.rooms.rooms), what="room locked")
+    w.rooms.table.selectRow(next(r for r in range(2) if w.rooms.table.item(r, 0).text() == "Arena 2"))
+    w.rooms.close_btn.click()
+    wait_until(qapp, lambda: w.rooms.table.rowCount() == 1, what="room closed")
+    w.rooms.table.selectRow(0)
+    wait_until(qapp, lambda: w.rooms.players.count() == 1, what="players in lobby")
+    assert "Ann" in w.rooms.players.item(0).text()
+
+    # Players: online list and kick
+    w.nav.setCurrentRow(w.stack.indexOf(w.players))
+    wait_until(qapp, lambda: w.players.online.rowCount() == 1, what="online player")
+    wait_until(qapp, lambda: w.players.known.rowCount() == 1, what="known player")
+    w.players.online.selectRow(0)
+    from PySide6.QtWidgets import QInputDialog
+    orig = QInputDialog.getText
+    QInputDialog.getText = staticmethod(lambda *a, **k: ("test kick", True))
+    try:
+        w.players.kick_btn.click()
+    finally:
+        QInputDialog.getText = orig
+    wait_until(qapp, lambda: w.players.online.rowCount() == 0, what="player kicked")
+    ann.close()
+
+    # Settings: rename the server
+    w.nav.setCurrentRow(w.stack.indexOf(w.settings_page))
+    wait_until(qapp, lambda: w.settings_page.data is not None, what="settings loaded")
+    w.settings_page.name.setText("Friday Games")
+    w.settings_page.save()
+    wait_until(qapp, lambda: w.settings_page.data["server_name"] == "Friday Games", what="settings saved")
+
+    # Saves: snapshot now, backup, restore (stopped)
+    dlg = SavesDialog(w, w.client, card.game, str(w.data_dir))
+    dlg.save_btn.click()
+    wait_until(qapp, lambda: dlg.snapshots.rowCount() >= 1, what="snapshot listed")
+    card.buttons["stop"].click()
+    wait_until(qapp, lambda: card.game["state"] == "stopped", what="stopped")
+    dlg2 = SavesDialog(w, w.client, card.game, str(w.data_dir))
+    wait_until(qapp, lambda: dlg2.snapshots.rowCount() >= 2, what="stop snapshot listed")
+    dlg2.snapshots.selectRow(dlg2.snapshots.rowCount() - 1)
+    oldest = selected_key(dlg2.snapshots)
+    dlg2.restore_btn.click()
+    wait_until(qapp, lambda: dlg2.msg.text().startswith("✓ Відновлено"), what="restored")
+    wait_until(qapp, lambda: dlg2.backups.rowCount() == 1, what="before_restore backup")
+    assert "before_restore" in dlg2.backups.item(0, 0).text()
+    assert "restore" in dlg2.snapshots.item(0, 0).text() and oldest
+    dlg.close()
+    dlg2.close()

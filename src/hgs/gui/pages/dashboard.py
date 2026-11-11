@@ -72,6 +72,15 @@ class DashboardPage(QWidget):
         nl.addWidget(self.spark)
         root.addWidget(net)
 
+        srv_title = QLabel("Ігрові сервери: ресурси")
+        srv_title.setObjectName("CardTitle")
+        root.addWidget(srv_title)
+        from hgs.gui.widgets.table import make_table
+
+        self.servers_table = make_table(["Гра", "Стан", "Гравці", "Кімнати", "CPU", "RAM", "Працює"])
+        self.servers_table.setMaximumHeight(170)
+        root.addWidget(self.servers_table)
+
         ev_title = QLabel("Останні події")
         ev_title.setObjectName("CardTitle")
         root.addWidget(ev_title)
@@ -90,11 +99,33 @@ class DashboardPage(QWidget):
         self.servers.set(f"{st['games_running']} / {st['games_total']}", "запущено / зареєстровано ігор")
         self.players.set(str(st["players_online"]), f"кімнат відкрито: {st['rooms_open']}")
         net = st["network"]
-        mode = "лише цей ПК (localhost)" if net["mode"] == "local" else "локальна мережа (LAN)"
-        self.access.set("Local" if net["mode"] == "local" else "LAN",
-                        f"{mode}, порт {net['gateway_port']}.\nТунель та інтернет-доступ — Етап 4.")
+        names = {"local": ("Local", "лише цей ПК"), "lan": ("LAN", "домашня мережа"),
+                 "tunnel": ("Tunnel", "інтернет через тунель"), "direct": ("Direct", "інтернет напряму")}
+        title, mode = names.get(net["mode"], (net["mode"], ""))
+        tunnel = {"connected": "тунель підключено", "starting": "тунель запускається",
+                  "reconnecting": "тунель перепідключається", "failed": "помилка тунелю"}.get(net.get("tunnel_state", ""), "")
+        detail = f"{mode}, порт {net['gateway_port']}" + (f" · {tunnel}" if net["mode"] == "tunnel" and tunnel else "")
+        detail += "\n" + (net.get("player_url") or "адреса для гравців недоступна")
+        color = None
+        if net["mode"] == "tunnel":
+            color = GREEN if net.get("tunnel_state") == "connected" else YELLOW
+        self.access.set(title, detail, color)
         if st.get("resources"):
             self.update_metrics(st["resources"])
+
+    def update_games(self, games: list[dict]) -> None:
+        from hgs.gui.widgets.common import STATE_NAMES
+        from hgs.gui.widgets.table import fill
+
+        rows = []
+        for g in games:
+            m = g.get("metrics") or {}
+            rows.append([g["name"], STATE_NAMES.get(g["state"], g["state"]).lower(), str(g["players_online"]),
+                         str(g["rooms_open"]),
+                         f"{m['cpu_percent']:.0f}%" if m.get("cpu_percent") is not None else "у ядрі HGS",
+                         fmt_bytes(m["memory_bytes"]) if m.get("memory_bytes") is not None else "—",
+                         fmt_duration(g["uptime_s"])])
+        fill(self.servers_table, rows, keys=[g["id"] for g in games])
 
     def update_metrics(self, m: dict) -> None:
         self.cpu.set(f"{m['cpu_percent']:.0f}%", f"ядро HGS: {m['core_cpu_percent']:.1f}%")
