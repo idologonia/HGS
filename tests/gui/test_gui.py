@@ -123,7 +123,7 @@ def test_full_flow_add_start_player_stop(qapp, window, tmp_path):
         w.nav.setCurrentRow(1)
         card.buttons["start"].click()
         wait_until(qapp, lambda: card.game["state"] == "running", what="running again")
-        for i, name in ((0, "dashboard"), (1, "games"), (2, "logs")):
+        for i, name in ((0, "dashboard"), (1, "games"), (2, "network"), (3, "logs")):
             w.nav.setCurrentRow(i)
             for _ in range(30):
                 qapp.processEvents()
@@ -195,3 +195,21 @@ def test_gui_stays_responsive_under_load(qapp, window):
     assert meter.max_gap_ms < 500, f"GUI event loop stalled for {meter.max_gap_ms} ms"
     wait_until(qapp, lambda: "Bot4 joined" in w.logs.view.toPlainText(), what="live log lines")
     wait_until(qapp, lambda: "процес гри" in card.stats.text(), what="worker metrics on the card")
+
+
+def test_network_page_switches_mode(qapp, window):
+    w = window
+    w.nav.setCurrentRow(w.stack.indexOf(w.network))
+    wait_until(qapp, lambda: w.network.view is not None, what="network view")
+    assert w.network.mode_buttons["local"].isChecked()
+    assert w.network.player_url.text().startswith("ws://127.0.0.1:")
+    assert not w.network.tunnel_start.isEnabled()  # not in tunnel mode
+    w.network.mode_buttons["lan"].setChecked(True)
+    w.network.apply_btn.click()  # confirmations are auto-accepted in tests
+    wait_until(qapp, lambda: w.network.view["bind"] == "0.0.0.0", what="LAN mode applied")
+    assert w.network.warnings.isVisible() and "LAN" in w.network.warnings.text()
+    w.network.mode_buttons["direct"].setChecked(True)
+    w.network.apply_btn.click()
+    wait_until(qapp, lambda: w.network.banner.isVisible(), what="error for direct mode without TLS")
+    assert "certificate" in w.network.banner.label.text()
+    assert w.network.view["settings"]["mode"] == "lan"  # unchanged after the refused change

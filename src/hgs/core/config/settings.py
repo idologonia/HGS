@@ -24,14 +24,41 @@ class AdminSettings(_Strict):
 
 class GatewaySettings(_Strict):
     port: int = Field(8765, ge=0, le=65535)
-    # local = only this PC (127.0.0.1); lan = all interfaces (0.0.0.0)
-    bind: Literal["local", "lan"] = "local"
+    # Deprecated (Stage 2): use network.mode. Kept so old settings files still load.
+    bind: Literal["local", "lan"] | None = None
     max_connections_per_ip: int = Field(8, ge=1, le=1000)
     hello_timeout_s: float = Field(5.0, gt=0, le=60)
 
 
 class WorkerBusSettings(_Strict):
     port: int = Field(8766, ge=0, le=65535)
+
+
+class TunnelSettings(_Strict):
+    # cloudflare_quick: free, no account, random https://*.trycloudflare.com address that changes on every start
+    # cloudflare_named: free Cloudflare account + your own domain; fixed address; token stored encrypted
+    provider: Literal["cloudflare_quick", "cloudflare_named"] = "cloudflare_quick"
+    cloudflared_path: str | None = None
+    named_public_url: str | None = Field(None, max_length=200)  # e.g. https://play.example.com
+
+
+class DirectSettings(_Strict):
+    public_host: str | None = Field(None, max_length=253)  # domain or IP players use
+    public_port: int | None = Field(None, ge=1, le=65535)  # external port if the router maps a different one
+    tls_cert: str | None = None  # PEM certificate (full chain)
+    tls_key: str | None = None   # PEM private key
+    duckdns_domain: str | None = Field(None, max_length=100, pattern=r"^[a-z0-9-]+$")  # "myhgs" for myhgs.duckdns.org
+
+
+class NetworkSettings(_Strict):
+    # local  = only this PC (127.0.0.1)
+    # lan    = home network (0.0.0.0), no TLS
+    # direct = internet through your router (0.0.0.0) with TLS (wss://)
+    # tunnel = internet through a tunnel; the gateway stays on 127.0.0.1
+    mode: Literal["local", "lan", "direct", "tunnel"] = "local"
+    tunnel: TunnelSettings = TunnelSettings()
+    direct: DirectSettings = DirectSettings()
+    public_ip_lookup: bool = True  # ask api.ipify.org for the public IP (Network page)
 
 
 class LogSettings(_Strict):
@@ -49,11 +76,22 @@ class Settings(_Strict):
     admin: AdminSettings = AdminSettings()
     gateway: GatewaySettings = GatewaySettings()
     worker_bus: WorkerBusSettings = WorkerBusSettings()
+    network: NetworkSettings = NetworkSettings()
     logs: LogSettings = LogSettings()
     resources: ResourceSettings = ResourceSettings()
 
+    def model_post_init(self, _ctx) -> None:
+        # migrate the Stage 2 field
+        if self.gateway.bind == "lan" and self.network.mode == "local":
+            self.network.mode = "lan"
+        self.gateway.bind = None
+
     def bind_host(self) -> str:
-        return "0.0.0.0" if self.gateway.bind == "lan" else "127.0.0.1"
+        return "0.0.0.0" if self.network.mode in ("lan", "direct") else "127.0.0.1"
+
+    @property
+    def internet_exposed(self) -> bool:
+        return self.network.mode in ("direct", "tunnel")
 
 
 class SettingsError(RuntimeError):

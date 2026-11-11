@@ -178,6 +178,9 @@
     }
 
     _authPayload() {
+      // 0) resume the same session right after a dropped connection (one-time token, short window)
+      const r = this._resume;
+      if (r && r.until && Date.now() < r.until) return { type: "resume", session_id: r.sessionId, resume_token: r.token };
       // 1) an explicit token, 2) the token saved after an earlier login, 3) invite / open login
       if (this._auth && this._auth.type === "token" && this._auth.token) return this._auth;
       const saved = this.savedToken;
@@ -248,13 +251,18 @@
           this.game = d.game || null;
           this.server = d.server;
           if (d.player_token) this._storage.setItem(this._tokenKey, d.player_token);
-          const resumed = this._attempt > 0;
+          // keep the one-time resume token in memory only (never in storage)
+          this._resume = d.resume_token ? { sessionId: d.session_id, token: d.resume_token, until: null,
+            windowMs: ((d.server && d.server.resume_window_s) || 30) * 1000 } : null;
+          const reconnected = this._attempt > 0;
           this._attempt = 0;
           this._setState("connected");
           this._startPing();
           for (const w of this._connectWaiters.splice(0)) w.resolve(this.player);
-          this._emit("hgs:connected", { player: this.player, game: this.game, resumed });
-          if (this._lastRoomId) {
+          this._emit("hgs:connected", { player: this.player, game: this.game, resumed: !!d.resumed, reconnected });
+          if (d.resumed && d.room_id && d.room_id === this._lastRoomId) {
+            // still in the room: the server sends room.joined with the current state
+          } else if (this._lastRoomId) {
             const rid = this._lastRoomId;
             this.joinRoom(rid).catch((e) => this._emit("hgs:error", e));
           }
@@ -263,7 +271,10 @@
         }
         case "auth_error": {
           const d = msg.d || {};
-          if (usedAuth && usedAuth.type === "token" && d.code === "unauthorized" && !(this._auth && this._auth.type === "token")) {
+          if (d.code === "resume_failed") {
+            this._resume = null; // session expired: log in again normally
+            this._retryWithAuth = true;
+          } else if (usedAuth && usedAuth.type === "token" && d.code === "unauthorized" && !(this._auth && this._auth.type === "token")) {
             this.forgetToken(); // stale token: try the invite / open login once more
             if (this._auth) this._retryWithAuth = true;
           }
@@ -342,6 +353,9 @@
       const authError = this._authError;
       this._authError = null;
       const wasConnected = this.state === "connected";
+      if (wasConnected && this._resume && !this._manualClose) {
+        this._resume.until = Date.now() + this._resume.windowMs - 2000;
+      }
       if (this._retryWithAuth && !this._manualClose) {
         this._retryWithAuth = false;
         this._open();
@@ -399,6 +413,7 @@
 
     disconnect() {
       this._manualClose = true;
+      this._resume = null;
       this._lastRoomId = null;
       clearTimeout(this._timer);
       this._stopPing();

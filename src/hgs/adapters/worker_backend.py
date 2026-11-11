@@ -107,6 +107,15 @@ class WorkerBackend:
         done, _ = await asyncio.wait({exit_wait, link_closed}, return_when=asyncio.FIRST_COMPLETED)
         if self.stopping:
             return
+        if exit_wait not in done:
+            # the link usually drops a moment before the OS reports the exit code
+            try:
+                await asyncio.wait_for(asyncio.shield(exit_wait), 1.0)
+                done = {exit_wait}
+            except asyncio.TimeoutError:
+                pass
+            if self.stopping:
+                return
         if exit_wait in done:
             reason = f"game worker exited unexpectedly (code {exit_wait.result()})"
             if self._last_err():

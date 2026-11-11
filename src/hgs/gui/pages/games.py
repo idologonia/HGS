@@ -278,6 +278,9 @@ class SettingsDialog(QDialog):
         row = QHBoxLayout()
         folder = QPushButton("Відкрити папку гри")
         folder.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(g["root_path"])))
+        self.pw_btn = QPushButton("Пароль гри…")
+        self.pw_btn.setVisible(g["auth_mode"] == "password")
+        self.pw_btn.clicked.connect(self._set_password)
         self.reload = QPushButton("Перечитати hgs-game.json")
         self.reload.setEnabled(g["state"] not in ACTIVE)
         self.reload.setToolTip("" if self.reload.isEnabled() else "Спочатку зупиніть сервер")
@@ -285,6 +288,7 @@ class SettingsDialog(QDialog):
         close = QPushButton("Закрити")
         close.clicked.connect(self.accept)
         row.addWidget(folder)
+        row.addWidget(self.pw_btn)
         row.addWidget(self.reload)
         row.addStretch(1)
         row.addWidget(close)
@@ -298,6 +302,19 @@ class SettingsDialog(QDialog):
                 self.view.setPlainText(json.dumps(json.load(f), indent=2, ensure_ascii=False))
         except Exception as exc:
             self.view.setPlainText(f"Не вдалося прочитати {path}: {exc}")
+
+    def _set_password(self) -> None:
+        from PySide6.QtWidgets import QInputDialog
+
+        pw, ok = QInputDialog.getText(self, "Пароль гри", "Новий пароль для входу в гру (мінімум 6 символів).\n"
+                                      "Він зберігається лише як хеш; повідомте його друзям самі:", QLineEdit.Password)
+        if not ok or not pw:
+            return
+
+        def done(ok: bool, data) -> None:
+            self.msg.setText("✓ Пароль гри встановлено" if ok else f"Помилка: {data}")
+            self.msg.setStyleSheet("" if ok else f"color: {RED};")
+        self.client.call("POST", f"/games/{self.g['id']}/password", {"password": pw}, done)
 
     def _reload(self) -> None:
         def done(ok: bool, data) -> None:
@@ -422,8 +439,16 @@ class InviteDialog(QDialog):
         self.code.setPlaceholderText("Код з'явиться тут")
         self.code.setStyleSheet("font-size: 16pt; font-family: Consolas, monospace;")
         lay.addWidget(self.code)
-        note = QLabel("Код показується лише один раз — HGS зберігає тільки його хеш. Передайте код гравцю; "
-                      "посилання для гри через інтернет з'явиться на Етапі 4.")
+        self.link = QLineEdit()
+        self.link.setReadOnly(True)
+        self.link.setPlaceholderText("Посилання для друзів з'явиться тут")
+        lay.addWidget(self.link)
+        self.link_note = QLabel()
+        self.link_note.setWordWrap(True)
+        self.link_note.setObjectName("Muted")
+        lay.addWidget(self.link_note)
+        note = QLabel("Код показується лише один раз — HGS зберігає тільки його хеш. Надішліть другу посилання "
+                      "(або код і адресу сервера).")
         note.setWordWrap(True)
         note.setObjectName("Muted")
         lay.addWidget(note)
@@ -431,9 +456,9 @@ class InviteDialog(QDialog):
         create = QPushButton("Створити код")
         create.setObjectName("Primary")
         create.clicked.connect(self._create)
-        self.copy = QPushButton("Копіювати")
+        self.copy = QPushButton("Копіювати посилання")
         self.copy.setEnabled(False)
-        self.copy.clicked.connect(lambda: QGuiApplication.clipboard().setText(self.code.text()))
+        self.copy.clicked.connect(lambda: QGuiApplication.clipboard().setText(self.link.text() or self.code.text()))
         close = QPushButton("Закрити")
         close.clicked.connect(self.accept)
         row.addWidget(create)
@@ -449,7 +474,18 @@ class InviteDialog(QDialog):
         def done(ok: bool, data) -> None:
             if ok:
                 self.code.setText(data["code"])
+                self.link.setText(data.get("link") or "")
+                self.copy.setText("Копіювати посилання" if data.get("link") else "Копіювати код")
                 self.copy.setEnabled(True)
+                if not data.get("link"):
+                    reasons = []
+                    if not self.g.get("client_url"):
+                        reasons.append("у hgs-game.json не вказано client.url (адреса гри на GitHub Pages)")
+                    if not data.get("server_url"):
+                        reasons.append("немає публічної адреси сервера (запустіть тунель на сторінці Network)")
+                    self.link_note.setText("Посилання не створено: " + "; ".join(reasons) + ".")
+                else:
+                    self.link_note.setText(f"Адреса сервера: {data['server_url']}")
             else:
                 QMessageBox.critical(self, "Помилка", str(data))
         self.client.call("POST", "/invites", body, done)

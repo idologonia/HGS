@@ -54,7 +54,28 @@ class AuthToken(_A):
     token: str = Field(min_length=16, max_length=128)
 
 
-AuthPayload = Annotated[Union[AuthOpen, AuthInvite, AuthToken], Field(discriminator="type")]
+class AuthPassword(_A):
+    type: Literal["password"]
+    name: str = Field(pattern=NAME_PATTERN)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class AuthAccount(_A):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    type: Literal["account"]
+    username: str = Field(pattern=NAME_PATTERN)
+    password: str = Field(min_length=1, max_length=128)
+    register_: bool = Field(False, alias="register")
+
+
+class AuthResume(_A):
+    type: Literal["resume"]
+    session_id: str = Field(min_length=4, max_length=64)
+    resume_token: str = Field(min_length=16, max_length=128)
+
+
+AuthPayload = Annotated[Union[AuthOpen, AuthInvite, AuthToken, AuthPassword, AuthAccount, AuthResume],
+                        Field(discriminator="type")]
 
 
 class ClientInfo(_A):

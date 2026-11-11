@@ -1,8 +1,14 @@
-"""Session Manager: one authenticated WebSocket connection of a player to one game."""
+"""Session Manager: one authenticated connection of a player to one game.
+
+A session can outlive a dropped connection for a short "resume window": the player stays
+in the room and can come back with a one-time resume token (rotated on every use).
+"""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import secrets
 import time
@@ -22,19 +28,8 @@ class Session:
 
     OUTBOX_LIMIT = 512
 
-    def __init__(
-        self,
-        *,
-        game_id: str,
-        player_id: str,
-        name: str,
-        ip: str,
-        send_text: Callable[[str], Awaitable[None]],
-        close_ws: Callable[[int, str], Awaitable[None]],
-        rate: float,
-        burst: int,
-        max_message_bytes: int,
-    ) -> None:
+    def __init__(self, *, game_id: str, player_id: str, name: str, ip: str, rate: float, burst: int,
+                 max_message_bytes: int) -> None:
         self.id = "s_" + secrets.token_urlsafe(12)
         self.game_id = game_id
         self.player_id = player_id
@@ -49,19 +44,60 @@ class Session:
         self.max_message_bytes = max_message_bytes
         self.messages_in = 0
         self.messages_out = 0
-        self.closed = False
+        self.closed = False  # permanently finished
+        self.cleaned = False  # removed from rooms and the session list
+        self.generation = 0  # incremented on every resume (identifies the current connection)
         self.close_code: int | None = None
-        self._send_text = send_text
-        self._close_ws = close_ws
-        self._outbox: asyncio.Queue = asyncio.Queue()
-        self._writer = asyncio.create_task(self._write_loop(), name=f"ws-writer-{self.id}")
+        self.detached_until: float | None = None
+        self._resume_hash: bytes | None = None
+        self._outbox: asyncio.Queue | None = None
+        self._writer: asyncio.Task | None = None
+        self._send_text: Callable[[str], Awaitable[None]] | None = None
+        self._close_ws: Callable[[int, str], Awaitable[None]] | None = None
+        # called when a detached session is closed/expired (nobody else will clean it up)
+        self.on_dead: Callable[["Session"], None] | None = None
 
     def public(self) -> dict:
         return {"id": self.player_id, "name": self.name}
 
+    @property
+    def detached(self) -> bool:
+        return self.detached_until is not None
+
+    # -- connection attach/detach -------------------------------------------------
+    def attach(self, send_text: Callable[[str], Awaitable[None]], close_ws: Callable[[int, str], Awaitable[None]]) -> None:
+        self._send_text = send_text
+        self._close_ws = close_ws
+        self._outbox = asyncio.Queue()
+        self.detached_until = None
+        self.bad_messages = 0
+        self._writer = asyncio.create_task(self._write_loop(self._outbox), name=f"ws-writer-{self.id}")
+
+    def detach(self, window_s: float) -> None:
+        """The connection dropped: keep the session for `window_s` seconds."""
+        if self._writer is not None:
+            self._writer.cancel()
+        self._writer = None
+        self._outbox = None
+        self.detached_until = time.time() + window_s
+
+    def new_resume_token(self) -> str:
+        token = secrets.token_urlsafe(32)
+        self._resume_hash = hashlib.sha256(token.encode()).digest()
+        return token
+
+    def check_resume_token(self, token: str) -> bool:
+        if self._resume_hash is None:
+            return False
+        ok = hmac.compare_digest(self._resume_hash, hashlib.sha256(token.encode()).digest())
+        if ok:
+            self._resume_hash = None  # one-time
+        return ok
+
+    # -- sending ------------------------------------------------------------------
     def send(self, text: str) -> None:
-        if self.closed:
-            return
+        if self.closed or self._outbox is None:
+            return  # detached: messages are dropped (the room state is re-sent on resume)
         if self._outbox.qsize() >= self.OUTBOX_LIMIT:
             log.warning("session %s outbox overflow, disconnecting slow client", self.id)
             self.close(1013, "client too slow")
@@ -73,12 +109,15 @@ class Session:
             return
         self.closed = True
         self.close_code = code
-        self._outbox.put_nowait((_CLOSE, code, reason))
+        if self._outbox is not None:
+            self._outbox.put_nowait((_CLOSE, code, reason))
+        elif self.on_dead is not None:
+            self.on_dead(self)
 
-    async def _write_loop(self) -> None:
+    async def _write_loop(self, outbox: asyncio.Queue) -> None:
         try:
             while True:
-                item = await self._outbox.get()
+                item = await outbox.get()
                 if isinstance(item, tuple) and item and item[0] is _CLOSE:
                     _, code, reason = item
                     try:
@@ -90,16 +129,18 @@ class Session:
                     await self._send_text(item)
                     self.messages_out += 1
                 except Exception:
-                    self.closed = True
                     return
         except asyncio.CancelledError:
             pass
 
     async def wait_closed(self, timeout: float = 5.0) -> None:
+        writer = self._writer
+        if writer is None:
+            return
         try:
-            await asyncio.wait_for(asyncio.shield(self._writer), timeout)
+            await asyncio.wait_for(asyncio.shield(writer), timeout)
         except (asyncio.TimeoutError, Exception):
-            self._writer.cancel()
+            writer.cancel()
 
 
 class SessionManager:
@@ -131,6 +172,9 @@ class SessionManager:
         if self._by_player.get((s.game_id, s.player_id)) is s:
             del self._by_player[(s.game_id, s.player_id)]
 
+    def get(self, session_id: str) -> Session | None:
+        return self._by_id.get(session_id)
+
     def get_player(self, game_id: str, player_id: str) -> Session | None:
         return self._by_player.get((game_id, player_id))
 
@@ -139,6 +183,10 @@ class SessionManager:
 
     def all(self) -> list[Session]:
         return list(self._by_id.values())
+
+    def expired(self, now: float | None = None) -> list[Session]:
+        now = time.time() if now is None else now
+        return [s for s in self._by_id.values() if s.detached_until is not None and s.detached_until <= now]
 
     def count(self, game_id: str | None = None) -> int:
         if game_id is None:

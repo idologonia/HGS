@@ -141,3 +141,19 @@ async def test_sdk_validates_arguments(hgs, browser):
     assert rooms[0]["id"] == "lobby"
     err = await a.evaluate("demo.hgs.joinRoom('missing').catch(e => e.code)")
     assert err == "room_not_found"
+
+
+async def test_sdk_resumes_session_after_network_drop(hgs, browser):
+    await start_demo(hgs, "relay", "demo-arena")
+    a = await open_player(browser, hgs, "demo-arena", "Ann")
+    b = await open_player(browser, hgs, "demo-arena", "Bob")
+    await b.evaluate("window.left = []; demo.hgs.on('hgs:player_left', d => left.push(d.player.name)); null")
+    await a.evaluate("window.conn = []; demo.hgs.on('hgs:connected', d => conn.push(d)); null")
+    pid = await player_id(a)
+    await a.evaluate("demo.hgs._ws.close(4000, 'simulated network drop')")
+    await a.wait_for_function("conn.length === 1 && demo.hgs.state === 'connected' && demo.hgs.room", timeout=10000)
+    info = await a.evaluate("conn[0]")
+    assert info["resumed"] is True and info["player"]["id"] == pid
+    assert await a.evaluate("demo.hgs.room.id") == "lobby"
+    await asyncio.sleep(0.3)
+    assert await b.evaluate("left") == []  # Bob never saw Ann leave

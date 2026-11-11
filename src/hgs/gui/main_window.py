@@ -16,10 +16,11 @@ from hgs.gui.core_launcher import CoreLauncher
 from hgs.gui.pages.dashboard import DashboardPage
 from hgs.gui.pages.games import GamesPage
 from hgs.gui.pages.logs import LogsPage
+from hgs.gui.pages.network import NetworkPage
 from hgs.gui.widgets.common import Banner
 
 # Events after which the game list is re-read (debounced).
-GAME_EVENTS = ("server.state_changed", "game.", "player.", "room.")
+GAME_EVENTS = ("server.state_changed", "game.", "player.", "room.", "network.")
 
 
 class MainWindow(QMainWindow):
@@ -82,8 +83,10 @@ class MainWindow(QMainWindow):
         self.dashboard = DashboardPage()
         self.games = GamesPage(self.client)
         self.logs = LogsPage(self.client, str(data_dir / "logs"))
+        self.network = NetworkPage(self.client)
         self.games.open_logs.connect(self.show_logs)
-        for name, page in (("Dashboard", self.dashboard), ("Games", self.games), ("Logs", self.logs)):
+        for name, page in (("Dashboard", self.dashboard), ("Games", self.games), ("Network", self.network),
+                           ("Logs", self.logs)):
             self.nav.addItem(name)
             self.stack.addWidget(page)
         self.nav.currentRowChanged.connect(self._on_nav)
@@ -151,6 +154,8 @@ class MainWindow(QMainWindow):
             return
         if t == "core.hello":
             self.dashboard.update_status(ev["data"])
+            for w in ev["data"].get("warnings") or []:
+                self.banner.show_message(w)
             if ev["data"].get("previous_unclean_shutdown"):
                 self.info_banner.show_message(
                     "Минулого разу HGS завершився некоректно (збій або вимкнення ПК). Ігрові сервери не запускаються "
@@ -165,6 +170,8 @@ class MainWindow(QMainWindow):
             return
         self.games.refresh()
         self.client.call("GET", "/status", None, self._on_status)
+        if self.stack.currentWidget() is self.network:
+            self.network.refresh()
 
     def _on_status(self, ok: bool, st) -> None:
         if not ok:
@@ -180,9 +187,11 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(row)
         if self.stack.currentWidget() is self.logs and self._core_ready and self.logs.source.count() == 0:
             self.logs.load_sources()
+        if self.stack.currentWidget() is self.network and self._core_ready:
+            self.network.refresh()
 
     def show_logs(self, source: str) -> None:
-        self.nav.setCurrentRow(2)
+        self.nav.setCurrentRow(self.stack.indexOf(self.logs))
         self.logs.show_source(source)
 
     # -- closing --------------------------------------------------------------------

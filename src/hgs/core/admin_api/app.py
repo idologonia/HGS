@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 
 from hgs import __version__
 from hgs.core.config.manifest import GAME_ID_PATTERN
+from hgs.core.config.settings import NetworkSettings
+from hgs.core.network.manager import NetworkError
 from hgs.core.rooms import RoomError
 from hgs.core.server_manager import GameError
 
@@ -53,6 +55,23 @@ class Kick(BaseModel):
     reason: str = Field("kicked by admin", max_length=120)
 
 
+class Ban(BaseModel):
+    reason: str = Field("banned by admin", max_length=120)
+
+
+class NetworkUpdate(BaseModel):
+    network: NetworkSettings
+    gateway_port: int | None = Field(None, ge=1, le=65535)
+
+
+class SecretValue(BaseModel):
+    value: str = Field(min_length=1, max_length=4096)
+
+
+class GamePassword(BaseModel):
+    password: str = Field(min_length=6, max_length=128)
+
+
 def _check_host_origin(core: "CoreApp", headers: Any) -> None:
     host = (headers.get("host") or "").lower()
     if host not in core.admin_allowed_hosts():
@@ -83,6 +102,10 @@ def create_admin_app(core: "CoreApp") -> FastAPI:
     @app.exception_handler(RoomError)
     async def _room_error(request: Request, exc: RoomError) -> JSONResponse:
         return JSONResponse({"error": exc.code, "message": exc.message}, status_code=_STATUS.get(exc.code, 400))
+
+    @app.exception_handler(NetworkError)
+    async def _network_error(request: Request, exc: NetworkError) -> JSONResponse:
+        return JSONResponse({"error": "bad_request", "message": str(exc)}, status_code=400)
 
     @app.exception_handler(ValueError)
     async def _value_error(request: Request, exc: ValueError) -> JSONResponse:
@@ -163,8 +186,76 @@ def create_admin_app(core: "CoreApp") -> FastAPI:
     # -- invites, rooms, players --------------------------------------------------
     @app.post(f"{api}/invites", dependencies=deps, status_code=201)
     async def create_invite(body: CreateInvite) -> dict:
-        core.servers._get(body.game_id)
-        return await core.auth.create_invite(body.game_id, max_uses=body.max_uses, ttl_s=body.ttl_s, label=body.label)
+        game = core.servers._get(body.game_id)
+        inv = await core.auth.create_invite(body.game_id, max_uses=body.max_uses, ttl_s=body.ttl_s, label=body.label)
+        inv["server_url"] = core.network.player_url()
+        inv["link"] = core.network.invite_link(game.manifest.client.url, inv["code"])
+        return inv
+
+    @app.post(f"{api}/games/{{game_id}}/password", dependencies=deps)
+    async def set_password(game_id: str, body: GamePassword) -> dict:
+        core.servers._get(game_id)
+        await core.auth.set_game_password(game_id, body.password)
+        log.info("game password changed for %s", game_id)
+        return {"ok": True}
+
+    @app.get(f"{api}/games/{{game_id}}/auth", dependencies=deps)
+    async def game_auth(game_id: str) -> dict:
+        g = core.servers._get(game_id)
+        return {"mode": g.manifest.auth.mode, "password_set": await core.auth.has_game_password(game_id),
+                "allow_register": g.manifest.auth.allow_register}
+
+    # -- network --------------------------------------------------------------------
+    @app.get(f"{api}/network", dependencies=deps)
+    async def network() -> dict:
+        view = core.network.view()
+        view["secrets_set"] = await core.secrets.names()
+        return view
+
+    @app.put(f"{api}/network", dependencies=deps)
+    async def update_network(body: NetworkUpdate) -> dict:
+        await core.network.apply(body.network, body.gateway_port)
+        return core.network.view()
+
+    @app.post(f"{api}/network/tunnel/start", dependencies=deps)
+    async def tunnel_start() -> dict:
+        await core.network.start_tunnel()
+        return core.network.view()
+
+    @app.post(f"{api}/network/tunnel/stop", dependencies=deps)
+    async def tunnel_stop() -> dict:
+        await core.network.stop_tunnel()
+        return core.network.view()
+
+    @app.post(f"{api}/network/check", dependencies=deps)
+    async def network_check() -> dict:
+        return await core.network.check_reachability()
+
+    @app.post(f"{api}/network/public-ip", dependencies=deps)
+    async def public_ip() -> dict:
+        ip = await core.network.lookup_public_ip()
+        return {"public_ip": ip, "error": core.network.public_ip_error}
+
+    @app.post(f"{api}/network/cloudflared/download", dependencies=deps)
+    async def download_cloudflared() -> dict:
+        from hgs.core.network.cloudflared_download import DownloadError, download
+
+        try:
+            result = await asyncio.to_thread(download, core.paths.root / "bin")
+        except DownloadError as exc:
+            raise GameError("bad_request", str(exc))
+        log.info("cloudflared %s downloaded and verified (sha256 %s)", result["version"], result["sha256"])
+        return result
+
+    @app.put(f"{api}/secrets/{{name}}", dependencies=deps)
+    async def set_secret(name: str, body: SecretValue) -> dict:
+        await core.secrets.set(name, body.value.strip())
+        return {"ok": True, "protected": core.secrets.protected}
+
+    @app.delete(f"{api}/secrets/{{name}}", dependencies=deps)
+    async def delete_secret(name: str) -> dict:
+        await core.secrets.delete(name)
+        return {"ok": True}
 
     @app.get(f"{api}/rooms", dependencies=deps)
     async def rooms(game_id: str | None = None) -> list:
@@ -193,6 +284,37 @@ def create_admin_app(core: "CoreApp") -> FastAPI:
              "connected_at": s.connected_at, "last_activity": s.last_activity}
             for s in core.sessions.all() if game_id is None or s.game_id == game_id
         ]
+
+    @app.get(f"{api}/players/known", dependencies=deps)
+    async def known_players(game_id: str) -> list:
+        core.servers._get(game_id)
+        rows = await core.db.fetchall(
+            "SELECT player_id, display_name AS name, auth_method, created_at, last_seen_at, banned, ban_reason "
+            "FROM players WHERE game_id=? ORDER BY last_seen_at DESC LIMIT 500", (game_id,))
+        online = {s.player_id for s in core.sessions.for_game(game_id)}
+        for r in rows:
+            r["online"] = r["player_id"] in online
+        return rows
+
+    @app.post(f"{api}/players/{{game_id}}/{{player_id}}/ban", dependencies=deps)
+    async def ban(game_id: str, player_id: str, body: Ban = Body(default_factory=Ban)) -> dict:
+        if not await core.auth.set_banned(game_id, player_id, True, body.reason):
+            raise GameError("not_found", "player not found")
+        await core.auth.revoke_player_tokens(game_id, player_id)
+        core.gateway.kick(game_id, player_id, body.reason)
+        log.info("player %s banned in %s: %s", player_id, game_id, body.reason)
+        return {"ok": True}
+
+    @app.post(f"{api}/players/{{game_id}}/{{player_id}}/unban", dependencies=deps)
+    async def unban(game_id: str, player_id: str) -> dict:
+        if not await core.auth.set_banned(game_id, player_id, False):
+            raise GameError("not_found", "player not found")
+        return {"ok": True}
+
+    @app.post(f"{api}/players/{{game_id}}/{{player_id}}/revoke-tokens", dependencies=deps)
+    async def revoke(game_id: str, player_id: str) -> dict:
+        n = await core.auth.revoke_player_tokens(game_id, player_id)
+        return {"ok": True, "revoked": n}
 
     @app.post(f"{api}/players/{{game_id}}/{{player_id}}/kick", dependencies=deps)
     async def kick(game_id: str, player_id: str, body: Kick = Body(default_factory=Kick)) -> dict:

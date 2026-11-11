@@ -39,8 +39,12 @@ class ClientSection(_Strict):
 
 
 class AuthSection(_Strict):
-    # Stage 2 implements "invite" and "open". "password"/"account" arrive in Stage 4.
-    mode: Literal["invite", "open"] = "invite"
+    # invite   — the owner creates codes in HGS (default)
+    # password — one shared game password, set in HGS (never stored in the game repository)
+    # account  — players register a name + password inside this game
+    # open     — name only; allowed only in local/LAN network mode (for testing)
+    mode: Literal["invite", "password", "account", "open"] = "invite"
+    allow_register: bool = True  # account mode: players may create accounts themselves
 
 
 class RoomsSection(_Strict):

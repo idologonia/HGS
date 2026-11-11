@@ -32,7 +32,9 @@ from hgs.core.db.database import Database
 from hgs.core.events import EventBus
 from hgs.core.logging_setup import LogManager, register_secret
 from hgs.core.network.gateway import TRANSPORT_MAX_BYTES, Gateway
+from hgs.core.network.manager import NetworkError, NetworkManager
 from hgs.core.network.worker_bus import WorkerBus
+from hgs.core.secret_store import SecretStore
 from hgs.core.process_supervisor import AllowList
 from hgs.core.saves import SaveManager
 from hgs.core.resources import ResourceMonitor
@@ -79,7 +81,10 @@ class CoreApp:
         self.admin_port = 0
         self.gateway_port = 0
         self._lock = InstanceLock(self.paths.lock)
-        self._servers: list[tuple[_EmbeddedServer, asyncio.Task]] = []
+        self._servers: dict[str, tuple[_EmbeddedServer, asyncio.Task]] = {}
+        self.gateway_tls = False
+        self.startup_warnings: list[str] = []
+        self.settings_is_override = settings is not None
         self._bg: list[asyncio.Task] = []
         self._shutdown = asyncio.Event()
         self.shutdown_reason: str | None = None
@@ -106,6 +111,7 @@ class CoreApp:
         self.db = Database(self.paths.db)
         await self.db.open()
         self.journal = SecurityJournal(self.db, self.bus)
+        self.secrets = SecretStore(self.db)
         self.auth = AuthManager(self.db, self.journal)
         self.sessions = SessionManager()
         self.rooms = RoomManager(self.bus)
@@ -119,16 +125,26 @@ class CoreApp:
         self.gateway = Gateway(self)
         self.servers.kick = self.gateway.kick
         self.resources = ResourceMonitor(self.bus, self.settings.resources.metrics_interval_s)
+        self.network = NetworkManager(self)
+
+        if self.settings.network.mode == "direct":
+            d = self.settings.network.direct
+            try:
+                NetworkManager.validate_tls(d.tls_cert, d.tls_key)
+            except NetworkError as exc:
+                msg = f"Direct mode disabled at startup: {exc}. The gateway runs in Local mode."
+                log.error(msg)
+                self.startup_warnings.append(msg)
+                self.settings.network.mode = "local"
 
         admin_sock = _bind("127.0.0.1", self.settings.admin.port)
-        gw_sock = _bind(self.settings.bind_host(), self.settings.gateway.port)
         wb_sock = _bind("127.0.0.1", self.settings.worker_bus.port)
         self.admin_port = admin_sock.getsockname()[1]
-        self.gateway_port = gw_sock.getsockname()[1]
         self.worker_bus.port = wb_sock.getsockname()[1]
         await self._serve(create_admin_app(self), admin_sock, "admin")
-        await self._serve(self.gateway.app, gw_sock, "gateway")
         await self._serve(self.worker_bus.app, wb_sock, "worker-bus")
+        await self._start_gateway()
+        await self.network.start()
 
         self.resources.start()
         self._bg.append(asyncio.get_running_loop().create_task(self._reaper(), name="room-reaper"))
@@ -147,15 +163,39 @@ class CoreApp:
         if self.previous_unclean:
             log.warning("previous HGS run did not shut down cleanly")
 
-    async def _serve(self, app: Any, sock: socket.socket, name: str) -> None:
+    async def _start_gateway(self) -> None:
+        sock = _bind(self.settings.bind_host(), self.settings.gateway.port)
+        tls: dict[str, Any] = {}
+        if self.settings.network.mode == "direct":
+            d = self.settings.network.direct
+            tls = {"ssl_certfile": d.tls_cert, "ssl_keyfile": d.tls_key}
+        self.gateway_port = sock.getsockname()[1]
+        await self._serve(self.gateway.app, sock, "gateway", **tls)
+        self.gateway_tls = bool(tls)
+
+    async def restart_gateway(self) -> None:
+        """Rebind the public gateway (network mode/port changed). Connected players are
+        disconnected and their SDKs reconnect (sessions can be resumed)."""
+        entry = self._servers.pop("gateway", None)
+        if entry is not None:
+            server, task = entry
+            server.should_exit = True
+            try:
+                await asyncio.wait_for(task, 10)
+            except asyncio.TimeoutError:
+                server.force_exit = True
+                await asyncio.wait([task], timeout=5)
+        await self._start_gateway()
+
+    async def _serve(self, app: Any, sock: socket.socket, name: str, **extra: Any) -> None:
         config = uvicorn.Config(
             app, lifespan="off", log_config=None, access_log=False, server_header=False,
             ws_max_size=TRANSPORT_MAX_BYTES, ws_ping_interval=15.0, ws_ping_timeout=20.0,
-            proxy_headers=False, timeout_graceful_shutdown=3,
+            proxy_headers=False, timeout_graceful_shutdown=3, **extra,
         )
         server = _EmbeddedServer(config)
         task = asyncio.get_running_loop().create_task(server.serve(sockets=[sock]), name=f"uvicorn-{name}")
-        self._servers.append((server, task))
+        self._servers[name] = (server, task)
         for _ in range(200):  # wait until it is accepting connections
             if server.started or task.done():
                 break
@@ -170,6 +210,7 @@ class CoreApp:
             try:
                 ttl = {gid: g.manifest.rooms.empty_ttl_s for gid, g in self.servers.games.items()}
                 self.rooms.reap_empty(ttl)
+                self.gateway.expire_sessions()
             except Exception:
                 log.exception("room reaper failed")
 
@@ -198,14 +239,16 @@ class CoreApp:
         log.info("core stopping: %s", self.shutdown_reason or "stop requested")
         if hasattr(self, "servers"):
             await self.servers.stop_all(grace_s=2.0)
+        if hasattr(self, "network"):
+            await self.network.stop()
         for t in self._bg:
             t.cancel()
         if hasattr(self, "resources"):
             await self.resources.stop()
-        for server, _ in self._servers:
+        for server, _ in self._servers.values():
             server.should_exit = True
         if self._servers:
-            await asyncio.wait([t for _, t in self._servers], timeout=8)
+            await asyncio.wait([t for _, t in self._servers.values()], timeout=8)
         if hasattr(self, "db"):
             await self.db.close()
         try:
@@ -231,9 +274,12 @@ class CoreApp:
             "uptime_s": round(time.time() - self.started_at),
             "previous_unclean_shutdown": self.previous_unclean,
             "data_dir": str(self.paths.root),
-            "network": {"mode": self.settings.gateway.bind, "bind": self.settings.bind_host(),
-                        "gateway_port": self.gateway_port,
-                        "local_url": f"ws://127.0.0.1:{self.gateway_port}/hgs/v1/ws"},
+            "network": {"mode": self.settings.network.mode, "bind": self.settings.bind_host(),
+                        "gateway_port": self.gateway_port, "tls": self.gateway_tls,
+                        "local_url": f"{'wss' if self.gateway_tls else 'ws'}://127.0.0.1:{self.gateway_port}",
+                        "player_url": self.network.player_url(),
+                        "tunnel_state": self.network.tunnel.state if self.network.tunnel else "stopped"},
+            "warnings": self.startup_warnings,
             "games_total": len(games),
             "games_running": sum(1 for g in games if g["state"] == "running"),
             "players_online": self.sessions.count(),

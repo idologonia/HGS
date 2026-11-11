@@ -9,6 +9,7 @@ local-only port. Path of every incoming frame (docs 02, §2.8):
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import secrets
 import time
@@ -32,8 +33,11 @@ from hgs.core.protocol.client import (
     CLOSE_REPLACED,
     CLOSE_TOO_LARGE,
     CLOSE_UNAUTHORIZED,
+    AuthAccount,
     AuthInvite,
     AuthOpen,
+    AuthPassword,
+    AuthResume,
     AuthToken,
     GameEvent,
     ProtocolError,
@@ -61,6 +65,7 @@ MAX_BAD_MESSAGES = 10
 ADAPTER_CALL_TIMEOUT_S = 5.0
 # Hard cap for the transport; per-game limits are smaller and checked in parse_frame.
 TRANSPORT_MAX_BYTES = 1024 * 1024 + 1024
+RESUME_WINDOW_S = 30
 
 
 def sdk_path():
@@ -117,7 +122,17 @@ class Gateway:
 
     # == WebSocket =================================================================
     def _client_ip(self, ws: WebSocket) -> str:
-        return ws.client.host if ws.client else "unknown"
+        peer = ws.client.host if ws.client else "unknown"
+        # Behind the tunnel every connection comes from the local cloudflared process; the real
+        # address is in CF-Connecting-IP. The header is trusted ONLY in tunnel mode and only from
+        # a local peer — anyone else could forge it.
+        if self.core.settings.network.mode == "tunnel" and peer in ("127.0.0.1", "::1"):
+            cf = ws.headers.get("cf-connecting-ip", "")
+            try:
+                return str(ipaddress.ip_address(cf.strip()))
+            except ValueError:
+                pass
+        return peer
 
     async def ws_endpoint(self, ws: WebSocket) -> None:
         ip = self._client_ip(ws)
@@ -128,14 +143,17 @@ class Gateway:
             return
         sessions.ip_acquire(ip)
         session: Session | None = None
+        generation = 0
+        client_code: int | None = None
         try:
             await ws.accept()
             session = await self._handshake(ws, ip)
             if session is None:
                 return
-            await self._receive_loop(ws, session)
-        except WebSocketDisconnect:
-            pass
+            generation = session.generation
+            client_code = await self._receive_loop(ws, session)
+        except WebSocketDisconnect as exc:
+            client_code = exc.code
         except Exception:
             log.exception("unexpected gateway error (ip=%s)", ip)
             if ws.application_state == WebSocketState.CONNECTED:
@@ -146,7 +164,23 @@ class Gateway:
         finally:
             sessions.ip_release(ip)
             if session is not None:
-                await self._cleanup(session, "disconnected")
+                await self._connection_lost(session, generation, client_code)
+
+    async def _connection_lost(self, s: Session, generation: int, client_code: int | None) -> None:
+        if s.generation != generation or s.cleaned:
+            return  # the session already moved to a newer connection
+        intentional = client_code == 1000
+        if s.closed or intentional or not self.core.servers.is_running(s.game_id):
+            await self._cleanup(s, "left" if intentional else "disconnected")
+            return
+        s.detach(RESUME_WINDOW_S)
+        log.info("player %s (%s) lost connection to %s; can resume for %d s", s.name, s.player_id, s.game_id,
+                 RESUME_WINDOW_S)
+        self.core.bus.publish("player.detached", game_id=s.game_id, player=s.public())
+
+    def expire_sessions(self) -> None:
+        for s in self.core.sessions.expired():
+            asyncio.get_running_loop().create_task(self._cleanup(s, "timeout"))
 
     async def _send_and_close(self, ws: WebSocket, text: str, code: int) -> None:
         try:
@@ -192,9 +226,19 @@ class Gateway:
                                        CLOSE_KICKED)
             return None
 
+        async def _send(text: str) -> None:
+            await ws.send_text(text)
+
+        async def _close(code: int, reason: str) -> None:
+            if ws.application_state == WebSocketState.CONNECTED:
+                await ws.close(code=code, reason=reason)
+
+        if isinstance(hello.auth, AuthResume):
+            return await self._resume(ws, ip, hello, env.seq or 0, _send, _close)
+
         new_token: str | None = None
         try:
-            player, new_token = await self._authenticate(hello.game, manifest.auth.mode, hello.auth, ip)
+            player, new_token = await self._authenticate(hello.game, manifest, hello.auth, ip)
         except AuthError as exc:
             await self._send_and_close(ws, msg("auth_error", {"code": exc.code, "message": exc.message}),
                                        CLOSE_FLOOD if exc.code == "rate_limited" else CLOSE_UNAUTHORIZED)
@@ -206,37 +250,21 @@ class Gateway:
                                                               "message": "game server is not running"}), CLOSE_GAME_STOPPED)
             return None
 
-        async def _send(text: str) -> None:
-            await ws.send_text(text)
-
-        async def _close(code: int, reason: str) -> None:
-            if ws.application_state == WebSocketState.CONNECTED:
-                await ws.close(code=code, reason=reason)
-
         limits = manifest.limits
         session = Session(
             game_id=hello.game, player_id=player.player_id, name=player.name, ip=ip,
-            send_text=_send, close_ws=_close,
             rate=limits.messages_per_s, burst=limits.burst, max_message_bytes=limits.max_message_bytes,
         )
+        session.on_dead = lambda s: asyncio.get_running_loop().create_task(self._cleanup(s, "closed"))
+        session.attach(_send, _close)
         session.last_seq = env.seq or 0
         old = core.sessions.add(session)
         if old is not None:
             await self._leave_room(old, "replaced")
             old.close(CLOSE_REPLACED, "connected from another place")
-        welcome: dict[str, Any] = {
-            "session_id": session.id,
-            "resumed": False,
-            "player": session.public(),
-            "game": {"id": manifest.id, "name": manifest.name, "version": manifest.version,
-                     "mode": (manifest.backend or {}).get("mode", "relay")},
-            "server": {
-                "protocol": PROTOCOL_VERSION,
-                "heartbeat_s": 15,
-                "limits": {"max_message_bytes": limits.max_message_bytes, "messages_per_s": limits.messages_per_s,
-                           "burst": limits.burst},
-            },
-        }
+            if old.detached:
+                await self._cleanup(old, "replaced")
+        welcome = self._welcome(session, manifest, resumed=False)
         if new_token:
             welcome["player_token"] = new_token
         session.send(msg("welcome", welcome))
@@ -244,24 +272,81 @@ class Gateway:
         core.bus.publish("player.connected", game_id=hello.game, player=session.public(), ip=ip)
         return session
 
-    async def _authenticate(self, game_id: str, mode: str, auth: Any, ip: str) -> tuple[PlayerInfo, str | None]:
+    def _welcome(self, session: Session, manifest: Any, resumed: bool) -> dict[str, Any]:
+        limits = manifest.limits
+        return {
+            "session_id": session.id,
+            "resume_token": session.new_resume_token(),
+            "resumed": resumed,
+            "player": session.public(),
+            "game": {"id": manifest.id, "name": manifest.name, "version": manifest.version,
+                     "mode": (manifest.backend or {}).get("mode", "relay")},
+            "server": {
+                "protocol": PROTOCOL_VERSION,
+                "heartbeat_s": 15,
+                "resume_window_s": RESUME_WINDOW_S,
+                "limits": {"max_message_bytes": limits.max_message_bytes, "messages_per_s": limits.messages_per_s,
+                           "burst": limits.burst},
+            },
+        }
+
+    async def _resume(self, ws: WebSocket, ip: str, hello: Any, seq: int, send: Any, close: Any) -> Session | None:
+        core = self.core
+        auth = hello.auth
+        s = core.sessions.get(auth.session_id)
+        valid = (s is not None and s.game_id == hello.game and s.detached and not s.closed
+                 and s.check_resume_token(auth.resume_token))
+        if not valid:
+            if s is not None and s.game_id == hello.game:
+                # a known session with a wrong/used token: possible replay
+                await core.journal.record("resume_token_rejected", "high", game_id=hello.game, ip=ip,
+                                          player_id=s.player_id)
+            await self._send_and_close(ws, msg("auth_error", {"code": "resume_failed",
+                                                              "message": "session expired, log in again"}),
+                                       CLOSE_UNAUTHORIZED)
+            return None
+        manifest = core.servers.games[hello.game].manifest
+        s.attach(send, close)
+        s.generation += 1
+        s.ip = ip
+        s.last_seq = seq
+        room = core.rooms.get(s.game_id, s.room_id) if s.room_id else None
+        welcome = self._welcome(s, manifest, resumed=True)
+        welcome["room_id"] = room.room_id if room is not None else None
+        s.send(msg("welcome", welcome))
+        if room is not None and room.players.get(s.player_id) is s:
+            s.send(msg("room.joined", core.rooms.joined_payload(room)))
+        log.info("player %s (%s) resumed session on %s", s.name, s.player_id, s.game_id)
+        core.bus.publish("player.resumed", game_id=s.game_id, player=s.public())
+        return s
+
+    async def _authenticate(self, game_id: str, manifest: Any, auth: Any, ip: str) -> tuple[PlayerInfo, str | None]:
         a = self.core.auth
+        mode = manifest.auth.mode
+        if isinstance(auth, AuthToken) and mode != "open":
+            return await a.login_token(game_id, auth.token, ip), None
         if mode == "open":
+            if self.core.settings.internet_exposed:
+                raise AuthError("forbidden", "open login is disabled while the server is reachable from the internet")
             if not isinstance(auth, AuthOpen):
                 raise AuthError("unauthorized", "this game uses open login: send {type:'open', name}")
             return await a.login_open(game_id, auth.name), None
-        if isinstance(auth, AuthInvite):
+        if mode == "invite" and isinstance(auth, AuthInvite):
             return await a.redeem_invite(game_id, auth.code, auth.name, ip)
-        if isinstance(auth, AuthToken):
-            return await a.login_token(game_id, auth.token, ip), None
-        raise AuthError("unauthorized", "this game requires an invite code or a player token")
+        if mode == "password" and isinstance(auth, AuthPassword):
+            return await a.login_password(game_id, auth.name, auth.password, ip)
+        if mode == "account" and isinstance(auth, AuthAccount):
+            return await a.login_account(game_id, auth.username, auth.password, auth.register_,
+                                         manifest.auth.allow_register, ip)
+        raise AuthError("unauthorized", f"this game requires {mode} login")
 
-    async def _receive_loop(self, ws: WebSocket, s: Session) -> None:
+    async def _receive_loop(self, ws: WebSocket, s: Session) -> int | None:
+        """Returns the client's close code (None when the server ended the session)."""
         denied = 0
         while not s.closed:
             message = await ws.receive()
             if message["type"] == "websocket.disconnect":
-                return
+                return message.get("code")
             raw = message.get("text") if message.get("text") is not None else message.get("bytes", b"")
             s.messages_in += 1
             s.last_activity = time.time()
@@ -270,7 +355,7 @@ class Gateway:
                 if denied > s.bucket.burst:
                     await self.core.journal.record("flood", game_id=s.game_id, ip=s.ip, player_id=s.player_id)
                     s.close(CLOSE_FLOOD, "too many messages")
-                    return
+                    return None
                 s.send(msg("error", {"code": "rate_limited", "message": "slow down"}))
                 continue
             denied = max(0, denied - 1)
@@ -288,17 +373,18 @@ class Gateway:
                     await self.core.journal.record("message_too_large", game_id=s.game_id, ip=s.ip, player_id=s.player_id)
                     s.send(msg("error", {"code": exc.code, "message": exc.message}))
                     s.close(CLOSE_TOO_LARGE, "message too large")
-                    return
+                    return None
                 s.bad_messages += 1
                 s.send(reply_err(req_id, exc.code, exc.message) if req_id else
                        msg("error", {"code": exc.code, "message": exc.message}))
                 if s.bad_messages >= MAX_BAD_MESSAGES:
                     await self.core.journal.record("malformed_messages", game_id=s.game_id, ip=s.ip, player_id=s.player_id)
                     s.close(CLOSE_PROTOCOL, "too many invalid messages")
-                    return
+                    return None
             except RoomError as exc:
                 s.send(reply_err(req_id, exc.code, exc.message) if req_id else
                        msg("error", {"code": exc.code, "message": exc.message}))
+        return None
 
     # == handlers ==================================================================
     async def _dispatch(self, s: Session, t: str, d: Any, req_id: str | None) -> None:
@@ -407,9 +493,12 @@ class Gateway:
             await self._adapter_call(s, "handle_disconnect", self._pref(s), self._rref(room), reason)
 
     async def _cleanup(self, s: Session, reason: str) -> None:
+        if s.cleaned:
+            return
+        s.cleaned = True
+        s.close(1000, "bye")  # no-op if already closed; ends the writer task
         await self._leave_room(s, reason)
         self.core.sessions.remove(s)
-        s.close(1000, "bye")
         await s.wait_closed(2.0)
         try:
             await self.core.db.execute("UPDATE players SET last_seen_at=datetime('now') WHERE game_id=? AND player_id=?",
@@ -424,5 +513,5 @@ class Gateway:
         if s is None:
             return False
         s.send(msg("kicked", {"reason": reason}))
-        s.close(CLOSE_KICKED, reason)
+        s.close(CLOSE_KICKED, reason)  # a detached session is cleaned up through on_dead
         return True
