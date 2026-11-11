@@ -11,6 +11,11 @@ on:
 permissions:
   contents: write
 
+# A newer push cancels older runs of the same workflow, so nothing waits in a queue.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
