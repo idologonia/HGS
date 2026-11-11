@@ -57,6 +57,9 @@ class _EmbeddedServer(uvicorn.Server):
 def _bind(host: str, port: int) -> socket.socket:
     try:
         sock = socket.create_server((host, port), backlog=128)
+        # Games send many small messages: disable Nagle's algorithm (otherwise a reply followed by an event
+        # can wait ~40 ms for a delayed ACK). Accepted connections inherit the option.
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except OSError as exc:
         raise CoreStartError(f"cannot listen on {host}:{port} — the port is busy or not allowed ({exc.strerror})") from exc
     sock.setblocking(False)

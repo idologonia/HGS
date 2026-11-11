@@ -51,7 +51,7 @@ class Harness:
     async def client(self, game_id: str, auth: dict | str, *, origin: str | None = None) -> "Client":
         if isinstance(auth, str):
             auth = {"type": "open", "name": auth}
-        c = Client(await websockets.connect(self.ws_url, origin=origin, max_size=4 * 1024 * 1024))
+        c = Client(await websockets.connect(self.ws_url, origin=origin, max_size=4 * 1024 * 1024, max_queue=None))
         await c.send("hello", {"game": game_id, "auth": auth})
         c.welcome = await c.recv()
         return c
@@ -150,3 +150,10 @@ async def core_factory(tmp_path: Path):
 @pytest.fixture
 async def hgs(core_factory) -> Harness:
     return await core_factory()
+
+
+def pytest_collection_modifyitems(config, items):
+    """Run GUI tests last. They create a Qt application inside the pytest process; on Linux
+    QProcess takes over SIGCHLD handling, after which asyncio can no longer observe child
+    processes exiting (HGS itself is not affected: the core and workers never load Qt)."""
+    items.sort(key=lambda item: "/tests/gui/" in str(item.fspath).replace("\\", "/"))
