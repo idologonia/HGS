@@ -16,6 +16,11 @@ def default_data_dir() -> Path:
     override = os.environ.get("HGS_DATA_DIR")
     if override:
         return Path(override)
+    if getattr(sys, "frozen", False):
+        # portable mode: a file named portable.txt next to HGS.exe keeps all data in .\data
+        exe_dir = Path(sys.executable).resolve().parent
+        if (exe_dir / "portable.txt").exists():
+            return exe_dir / "data"
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
         return Path(base) / "HGS"
