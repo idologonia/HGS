@@ -345,3 +345,25 @@ def test_players_rooms_settings_and_saves_pages(qapp, window, tmp_path):
     assert "restore" in dlg2.snapshots.item(0, 0).text() and oldest
     dlg.close()
     dlg2.close()
+
+
+def test_network_form_keeps_unsaved_input_and_saves_publish_settings(qapp, window):
+    w = window
+    n = w.network
+    w.nav.setCurrentRow(w.stack.indexOf(n))
+    wait_until(qapp, lambda: n.view is not None, what="network view")
+    n.pub_repo.setText("idologonia/hgs-address")
+    n.pub_repo.textEdited.emit("idologonia/hgs-address")  # as if typed
+    n.pub_enabled.click()
+    for _ in range(3):  # periodic refreshes must not erase the input
+        n.refresh()
+        time.sleep(0.2)
+        for _ in range(20):
+            qapp.processEvents()
+    assert n.pub_repo.text() == "idologonia/hgs-address" and n.pub_enabled.isChecked()
+    n.pub_now.click()  # saves, then tries to publish (no token here -> readable error)
+    wait_until(qapp, lambda: n.view["settings"]["publish"]["repo"] == "idologonia/hgs-address", what="saved")
+    wait_until(qapp, lambda: "токен" in n.pub_state.text(), what="publish error shown")
+    assert n.view["settings"]["publish"]["enabled"] is True and not n.dirty
+    n.refresh()
+    wait_until(qapp, lambda: n.pub_repo.text() == "idologonia/hgs-address", what="value survives refresh")

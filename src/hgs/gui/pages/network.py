@@ -172,8 +172,9 @@ class NetworkPage(QWidget):
         self.gh_btn.clicked.connect(lambda: self._set_secret("github_token", "Токен GitHub"))
         self.gh_state = QLabel()
         pf.addRow("Токен:", self._hbox(self.gh_btn, self.gh_state))
-        self.pub_now = QPushButton("Опублікувати зараз")
-        self.pub_now.clicked.connect(lambda: self._call("POST", "/network/publish", None, "Публікація адреси"))
+        self.pub_now = QPushButton("Зберегти й опублікувати")
+        self.pub_now.setObjectName("Primary")
+        self.pub_now.clicked.connect(self.save_and_publish)
         self.pub_state = QLabel()
         self.pub_state.setWordWrap(True)
         pf.addRow(self.pub_now, self.pub_state)
@@ -183,6 +184,7 @@ class NetworkPage(QWidget):
         self.game_line.setWordWrap(True)
         pf.addRow("У грі:", self.game_line)
         lay.addWidget(pb)
+        self.dirty = False  # the user changed fields that are not saved yet
 
         # -- direct ---------------------------------------------------------------
         db = QGroupBox("Пряме підключення (Direct)")
@@ -209,6 +211,18 @@ class NetworkPage(QWidget):
         self.duck_state.setObjectName("Muted")
         dform.addRow("", self.duck_state)
         lay.addWidget(db)
+
+        # mark the form as edited, so periodic refreshes do not overwrite what the user typed
+        for edit in (self.named_url, self.cf_path, self.public_host, self.cert, self.key, self.duck_domain,
+                     self.pub_repo, self.pub_path):
+            edit.textEdited.connect(self._mark_dirty)
+        for w in (self.port, self.public_port):
+            w.valueChanged.connect(lambda _v: self._mark_dirty() if self.view is not None and not self._loading else None)
+        self.pub_enabled.clicked.connect(self._mark_dirty)
+        self.provider.activated.connect(self._mark_dirty)
+        for b in self.mode_buttons.values():
+            b.clicked.connect(self._mark_dirty)
+        self._loading = False
 
         # -- diagnostics ------------------------------------------------------------
         diag = QGroupBox("Діагностика")
@@ -244,11 +258,25 @@ class NetworkPage(QWidget):
     def refresh(self) -> None:
         self.client.call("GET", "/network", None, self._on_view)
 
+    def _mark_dirty(self, *_: Any) -> None:
+        self.dirty = True
+        self.apply_btn.setText("Застосувати (є незбережені зміни)")
+
     def _on_view(self, ok: bool, data: Any) -> None:
         if not ok:
             self.banner.show_message(f"Не вдалося отримати мережеві налаштування: {data}")
             return
         self.view = data
+        self._fill_status(data)
+        if self.dirty:
+            return  # keep the user's unsaved input
+        self._loading = True
+        try:
+            self._fill_form(data)
+        finally:
+            self._loading = False
+
+    def _fill_form(self, data: dict) -> None:
         s = data["settings"]
         self.mode_buttons[s["mode"]].setChecked(True)
         if not self.port.hasFocus():
@@ -268,6 +296,14 @@ class NetworkPage(QWidget):
             if not edit.hasFocus():
                 edit.setText(value or "")
         self.public_port.setValue(s["direct"].get("public_port") or 0)
+        pub = s.get("publish", {})
+        self.pub_enabled.setChecked(bool(pub.get("enabled")))
+        self.pub_repo.setText(pub.get("repo") or "")
+        self.pub_path.setText(pub.get("path") or "hgs-server.json")
+        self._provider_changed()
+
+    def _fill_status(self, data: dict) -> None:
+        s = data["settings"]
         tun = data["tunnel"]
         text, color = TUNNEL_STATES.get(tun["state"], (tun["state"], MUTED))
         self.tunnel_state.setText(f"● {text}" + (f" — {tun['url']}" if tun.get("url") else ""))
@@ -287,11 +323,6 @@ class NetworkPage(QWidget):
         self.token_state.setText("✓ збережено" if has_token else "не вказано")
         self.duck_state.setText(data.get("duckdns") or "")
         pub = s.get("publish", {})
-        self.pub_enabled.setChecked(bool(pub.get("enabled")))
-        if not self.pub_repo.hasFocus():
-            self.pub_repo.setText(pub.get("repo") or "")
-        if not self.pub_path.hasFocus():
-            self.pub_path.setText(pub.get("path") or "hgs-server.json")
         self.gh_state.setText("✓ збережено" if "github_token" in data.get("secrets_set", []) else "не вказано")
         pv = data.get("publish") or {}
         self.pub_state.setText(pv.get("error") and f"✗ {pv['error']}" or pv.get("status") or "")
@@ -299,7 +330,6 @@ class NetworkPage(QWidget):
         repo = pub.get("repo") or "власник/репозиторій"
         file = "" if (pub.get("path") or "hgs-server.json") == "hgs-server.json" else "/" + pub["path"]
         self.game_line.setText(f'HGS.start({{ gameId: "...", server: "github:{repo}{file}" }})')
-        self._provider_changed()
         self.public_ip.setText(data["public_ip"] or (data["public_ip_error"] or "—"))
         if data["cgnat_suspected"]:
             self.cgnat.setText("⚠ Схоже на CGNAT провайдера: пряме підключення не працюватиме — використовуйте тунель.")
@@ -354,7 +384,35 @@ class NetworkPage(QWidget):
         body: dict[str, Any] = {"network": new}
         if self.port.value() != self.view["gateway_port"]:
             body["gateway_port"] = self.port.value()
-        self._call("PUT", "/network", body, "Мережеві налаштування")
+        self._save(body)
+
+    def _save(self, body: dict, then: Any = None) -> None:
+        def done(ok: bool, data: Any) -> None:
+            if ok:
+                self.dirty = False
+                self.apply_btn.setText("Застосувати")
+                self.banner.hide()
+                if then:
+                    then()
+            else:
+                self.banner.show_message(f"Мережеві налаштування: {data}")
+            self.refresh()
+        self.client.call("PUT", "/network", body, done)
+
+    def save_and_publish(self) -> None:
+        if self.view is None:
+            return
+        repo = self.pub_repo.text().strip()
+        if "/" not in repo:
+            self.pub_state.setText("✗ впишіть репозиторій у форматі логін/назва, наприклад idologonia/hgs-address")
+            self.pub_state.setStyleSheet(f"color: {RED};")
+            return
+        self.pub_enabled.setChecked(True)
+        # save only the publishing part; other unsaved changes stay as they are in the form
+        current = copy.deepcopy(self.view["settings"])
+        current["publish"] = {"enabled": True, "repo": repo, "path": self.pub_path.text().strip() or "hgs-server.json"}
+        self._save({"network": current},
+                   then=lambda: self._call("POST", "/network/publish", None, "Публікація адреси"))
 
     def _set_secret(self, name: str, title: str) -> None:
         value, ok = QInputDialog.getText(self, title, f"{title} (зберігається зашифрованим):", QLineEdit.Password)

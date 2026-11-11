@@ -2,7 +2,7 @@
 ; Installs per user (no administrator rights needed).
 #define AppVersion GetEnv("HGS_VERSION")
 #if AppVersion == ""
-  #define AppVersion "0.1.1"
+  #define AppVersion "0.1.2"
 #endif
 
 [Setup]
