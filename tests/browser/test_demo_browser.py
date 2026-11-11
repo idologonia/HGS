@@ -157,3 +157,65 @@ async def test_sdk_resumes_session_after_network_drop(hgs, browser):
     assert await a.evaluate("demo.hgs.room.id") == "lobby"
     await asyncio.sleep(0.3)
     assert await b.evaluate("left") == []  # Bob never saw Ann leave
+
+
+async def test_start_finds_server_on_github_and_remembers_login(hgs, browser, tmp_path):
+    """HGS.start(): no links — the address comes from GitHub, players sign up once, then just play."""
+    import json as _json
+
+    from tests.conftest import make_game_dir
+    from tests.fake_github import FakeGitHub
+
+    gh = FakeGitHub()
+    try:
+        d = make_game_dir(tmp_path, "acct-game", auth={"mode": "account"})
+        await hgs.admin.post("/games", json={"path": str(d)})
+        await hgs.admin.post("/games/acct-game/start")
+        key = "me/hgs-address/hgs-server.json"
+        gh.files[key] = _json.dumps({"server": None, "online": False}).encode()
+        page = await (await browser.new_context()).new_page()
+        sdk = (REPO / "sdk" / "js" / "hgs.js").as_uri()
+        html = (f'<html><body><script src="{sdk}"></script><script>'
+                f'HGS._discovery.api = "{gh.url}/repos/me/hgs-address/contents/hgs-server.json";'
+                'window.ready = HGS.start({ gameId: "acct-game", server: "github:me/hgs-address", lang: "uk" })'
+                '.then(c => { window.client = c; });</script></body></html>')
+        page_file = tmp_path / "game.html"
+        page_file.write_text(html)
+
+        # 1) the server is offline -> a clear message
+        await page.goto(page_file.as_uri())
+        await page.wait_for_selector("[data-retry]", timeout=10000)
+        assert "вимкнено" in await page.inner_text("[data-hgs-login]")
+
+        # 2) HGS publishes its address -> retry -> sign-up window -> play
+        gh.files[key] = _json.dumps({"server": f"ws://127.0.0.1:{hgs.core.gateway_port}", "online": True}).encode()
+        await page.click("[data-retry]")
+        await page.wait_for_selector('[name="u"]', timeout=10000)
+        await page.click('[data-tab="register"]')
+        await page.fill('[name="u"]', "Ann")
+        await page.fill('[name="p"]', "123")
+        await page.click("[data-go]")
+        assert "6" in await page.inner_text("[data-msg]")  # password too short, checked before sending
+        await page.fill('[name="p"]', "secret1")
+        await page.click("[data-go]")
+        await page.wait_for_function("window.client && client.state === 'connected' && client.room", timeout=10000)
+        assert await page.evaluate("client.player.name") == "Ann"
+        assert await page.query_selector("[data-hgs-login]") is None
+
+        # 3) next visit: no window at all, the login is remembered
+        await page.reload()
+        await page.wait_for_function("window.client && client.state === 'connected' && client.room", timeout=10000)
+        assert await page.query_selector("[data-hgs-login]") is None
+
+        # 4) a wrong password shows a readable error
+        ctx2 = await browser.new_context()
+        p2 = await ctx2.new_page()
+        await p2.goto(page_file.as_uri())
+        await p2.wait_for_selector('[name="u"]', timeout=10000)
+        await p2.fill('[name="u"]', "Ann")
+        await p2.fill('[name="p"]', "wrong-password")
+        await p2.click("[data-go]")
+        await p2.wait_for_function("document.querySelector('[data-msg]').textContent.includes('Неправильне')",
+                                   timeout=10000)
+    finally:
+        gh.close()

@@ -50,6 +50,13 @@ class DirectSettings(_Strict):
     duckdns_domain: str | None = Field(None, max_length=100, pattern=r"^[a-z0-9-]+$")  # "myhgs" for myhgs.duckdns.org
 
 
+class PublishSettings(_Strict):
+    # Publish the current server address to a file in a GitHub repository (games find the server by it).
+    enabled: bool = False
+    repo: str | None = Field(None, max_length=201, pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+    path: str = Field("hgs-server.json", max_length=200, pattern=r"^[A-Za-z0-9_./-]+\.json$")
+
+
 class NetworkSettings(_Strict):
     # local  = only this PC (127.0.0.1)
     # lan    = home network (0.0.0.0), no TLS
@@ -59,6 +66,7 @@ class NetworkSettings(_Strict):
     tunnel: TunnelSettings = TunnelSettings()
     direct: DirectSettings = DirectSettings()
     public_ip_lookup: bool = True  # ask api.ipify.org for the public IP (Network page)
+    publish: PublishSettings = PublishSettings()
 
 
 class LogSettings(_Strict):

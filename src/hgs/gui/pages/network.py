@@ -149,6 +149,41 @@ class NetworkPage(QWidget):
         tl.addWidget(self.limits)
         lay.addWidget(tb)
 
+        # -- publish the address on GitHub ------------------------------------------
+        pb = QGroupBox("Автоматична адреса для ігор (GitHub)")
+        pf = QFormLayout(pb)
+        hint = QLabel("HGS записує поточну адресу сервера у файл у вашому публічному GitHub-репозиторії. Ігри з "
+                      "HGS.start({server: \"github:власник/репозиторій\"}) знаходять сервер самі — друзям не потрібні "
+                      "посилання. Адреса не є секретом: для гри все одно потрібен вхід.")
+        hint.setWordWrap(True)
+        hint.setObjectName("Muted")
+        pf.addRow(hint)
+        from PySide6.QtWidgets import QCheckBox
+
+        self.pub_enabled = QCheckBox("Публікувати адресу")
+        pf.addRow(self.pub_enabled)
+        self.pub_repo = QLineEdit()
+        self.pub_repo.setPlaceholderText("idologonia/hgs-address")
+        pf.addRow("Репозиторій:", self.pub_repo)
+        self.pub_path = QLineEdit()
+        self.pub_path.setPlaceholderText("hgs-server.json")
+        pf.addRow("Файл:", self.pub_path)
+        self.gh_btn = QPushButton("Вказати токен GitHub…")
+        self.gh_btn.clicked.connect(lambda: self._set_secret("github_token", "Токен GitHub"))
+        self.gh_state = QLabel()
+        pf.addRow("Токен:", self._hbox(self.gh_btn, self.gh_state))
+        self.pub_now = QPushButton("Опублікувати зараз")
+        self.pub_now.clicked.connect(lambda: self._call("POST", "/network/publish", None, "Публікація адреси"))
+        self.pub_state = QLabel()
+        self.pub_state.setWordWrap(True)
+        pf.addRow(self.pub_now, self.pub_state)
+        self.game_line = QLabel()
+        self.game_line.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.game_line.setStyleSheet("font-family: Consolas, monospace;")
+        self.game_line.setWordWrap(True)
+        pf.addRow("У грі:", self.game_line)
+        lay.addWidget(pb)
+
         # -- direct ---------------------------------------------------------------
         db = QGroupBox("Пряме підключення (Direct)")
         dform = QFormLayout(db)
@@ -251,6 +286,19 @@ class NetworkPage(QWidget):
         has_token = "cloudflare_tunnel_token" in data.get("secrets_set", [])
         self.token_state.setText("✓ збережено" if has_token else "не вказано")
         self.duck_state.setText(data.get("duckdns") or "")
+        pub = s.get("publish", {})
+        self.pub_enabled.setChecked(bool(pub.get("enabled")))
+        if not self.pub_repo.hasFocus():
+            self.pub_repo.setText(pub.get("repo") or "")
+        if not self.pub_path.hasFocus():
+            self.pub_path.setText(pub.get("path") or "hgs-server.json")
+        self.gh_state.setText("✓ збережено" if "github_token" in data.get("secrets_set", []) else "не вказано")
+        pv = data.get("publish") or {}
+        self.pub_state.setText(pv.get("error") and f"✗ {pv['error']}" or pv.get("status") or "")
+        self.pub_state.setStyleSheet(f"color: {RED};" if pv.get("error") else "")
+        repo = pub.get("repo") or "власник/репозиторій"
+        file = "" if (pub.get("path") or "hgs-server.json") == "hgs-server.json" else "/" + pub["path"]
+        self.game_line.setText(f'HGS.start({{ gameId: "...", server: "github:{repo}{file}" }})')
         self._provider_changed()
         self.public_ip.setText(data["public_ip"] or (data["public_ip_error"] or "—"))
         if data["cgnat_suspected"]:
@@ -286,6 +334,8 @@ class NetworkPage(QWidget):
                            public_port=self.public_port.value() or None,
                            tls_cert=self.cert.text().strip() or None, tls_key=self.key.text().strip() or None,
                            duckdns_domain=self.duck_domain.text().strip().lower() or None)
+        s["publish"] = {"enabled": self.pub_enabled.isChecked(), "repo": self.pub_repo.text().strip() or None,
+                        "path": self.pub_path.text().strip() or "hgs-server.json"}
         return s
 
     def apply(self) -> None:

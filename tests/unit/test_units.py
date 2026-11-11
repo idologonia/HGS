@@ -113,3 +113,11 @@ async def test_event_bus_slow_subscriber_drops_oldest():
     got = [await sub.get() for _ in range(3)]
     assert [e.data["i"] for e in got] == [3, 4, 99]
     assert (await asyncio.wait_for(other.get(), 1)).data["i"] == 99
+
+
+def test_js_sdk_is_pure_ascii():
+    """hgs.js must work even on pages that do not declare their encoding."""
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[2] / "sdk" / "js" / "hgs.js").read_bytes()
+    assert all(b < 128 for b in text)

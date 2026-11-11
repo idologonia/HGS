@@ -40,7 +40,7 @@ def _unprotect(blob: bytes) -> str:
 
 
 class SecretStore:
-    NAMES = ("cloudflare_tunnel_token", "duckdns_token")
+    NAMES = ("cloudflare_tunnel_token", "duckdns_token", "github_token")
 
     def __init__(self, db: Database) -> None:
         self.db = db

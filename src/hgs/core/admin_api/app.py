@@ -358,6 +358,15 @@ def create_admin_app(core: "CoreApp") -> FastAPI:
         log.info("cloudflared %s downloaded and verified (sha256 %s)", result["version"], result["sha256"])
         return result
 
+    @app.post(f"{api}/network/publish", dependencies=deps)
+    async def publish_now() -> dict:
+        from hgs.core.network.publisher import PublishError
+
+        try:
+            return await core.network.publisher.publish()
+        except PublishError as exc:
+            raise GameError("bad_request", str(exc))
+
     @app.put(f"{api}/secrets/{{name}}", dependencies=deps)
     async def set_secret(name: str, body: SecretValue) -> dict:
         await core.secrets.set(name, body.value.strip())

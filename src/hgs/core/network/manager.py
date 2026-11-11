@@ -71,6 +71,10 @@ class NetworkManager:
         self.last_check: dict[str, Any] | None = None
         self.duckdns_status: str | None = None
         self._duckdns_task: asyncio.Task | None = None
+        from .publisher import AddressPublisher
+
+        self.publisher = AddressPublisher(core)
+        self._published_url: str | None = "unset"
 
     @property
     def settings(self) -> NetworkSettings:
@@ -138,11 +142,16 @@ class NetworkManager:
             "last_check": self.last_check,
             "warnings": self.warnings(),
             "secrets_protected": self.core.secrets.protected,
+            "publish": self.publisher.view(),
         }
 
     def _changed(self) -> None:
-        self.core.bus.publish("network.changed", mode=self.settings.mode, player_url=self.player_url(),
+        url = self.player_url()
+        self.core.bus.publish("network.changed", mode=self.settings.mode, player_url=url,
                               tunnel=self.tunnel.view() if self.tunnel else None)
+        if url != self._published_url:  # tell games where the server is now
+            self._published_url = url
+            self.publisher.schedule()
 
     # == settings ==================================================================
     @staticmethod
@@ -186,6 +195,7 @@ class NetworkManager:
         if not self.core.settings_is_override:
             atomic_write_json(self.core.paths.settings, updated.model_dump(exclude_none=True))
         self._restart_duckdns()
+        self._published_url = "unset"  # republish with the new settings
         log.info("network mode: %s (gateway %s:%d)", new.mode, updated.bind_host(), self.core.gateway_port)
         self._changed()
 
@@ -285,3 +295,9 @@ class NetworkManager:
         if self._duckdns_task:
             self._duckdns_task.cancel()
         await self.stop_tunnel()
+        if self.publisher.cfg.enabled and self.publisher.cfg.repo and self._published_url not in (None, "unset"):
+            try:  # games show "server offline" instead of trying a dead address
+                await asyncio.wait_for(self.publisher.publish({"server": None, "online": False, "updated": int(time.time()),
+                                                               "name": self.core.settings.server_name}), 15)
+            except Exception:
+                pass

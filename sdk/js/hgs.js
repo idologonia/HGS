@@ -1,8 +1,8 @@
 /*!
- * hgs.js — JavaScript SDK for HOME GAME SERVER (HGS)
- * Version 1.0.0 · Protocol v1 · No dependencies.
+ * hgs.js - JavaScript SDK for HOME GAME SERVER (HGS)
+ * Version 1.0.0 - Protocol v1 - No dependencies.
  *
- * Usage (classic script):  <script src="hgs.js"></script>  → global `HGS`
+ * Usage (classic script):  <script src="hgs.js"></script>  -> global `HGS`
  *
  *   const hgs = HGS.createClient({ serverUrl, gameId, auth: { type: "invite", code, name } });
  *   await hgs.connect();
@@ -23,7 +23,7 @@
   const VERSION = "1.0.0";
   const PROTOCOL = 1;
   const EVENT_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
-  // Close codes after which reconnecting makes no sense (docs 06, §6.2)
+  // Close codes after which reconnecting makes no sense (docs 06, section 6.2)
   const FATAL_CLOSE = { 4400: "protocol", 4401: "unauthorized", 4403: "kicked", 4409: "replaced", 4413: "too_large" };
 
   class HGSError extends Error {
@@ -72,7 +72,10 @@
     constructor(options) {
       const o = Object.assign({}, options || {});
       if (!o.gameId || !/^[a-z0-9][a-z0-9-]{1,47}$/.test(o.gameId)) throw new HGSError("bad_config", "gameId is missing or invalid");
-      this.url = normalizeUrl(o.serverUrl);
+      // "github:owner/repo[/file.json]" = find the current address in a file the HGS owner publishes
+      this._discover = typeof o.serverUrl === "string" && o.serverUrl.startsWith("github:") ? o.serverUrl.slice(7) : null;
+      this.url = this._discover ? null : normalizeUrl(o.serverUrl);
+      this.serverName = null;
       this.gameId = o.gameId;
       this.options = {
         reconnect: Object.assign({ enabled: true, maxAttempts: 10, baseDelayMs: 500, maxDelayMs: 10000 }, o.reconnect || {}),
@@ -81,7 +84,8 @@
         debug: !!o.debug,
       };
       this._storage = storageFor(o.storage || "localStorage");
-      this._tokenKey = "hgs:" + this.gameId + ":" + this.url + ":token";
+      // the saved login does not depend on the (changing) tunnel address
+      this._tokenKey = "hgs:" + this.gameId + ":" + (this._discover || this.url) + ":token";
       this._auth = o.auth || null;
       if (o.token) this._auth = { type: "token", token: o.token };
       this.state = "idle";
@@ -172,9 +176,30 @@
       if (this.state === "idle" || this.state === "disconnected" || this.state === "failed") {
         this._manualClose = false;
         this._attempt = 0;
-        this._open();
+        this._openResolved();
       }
       return p;
+    }
+
+    /** Find the server address (discovery mode), then open the connection. */
+    _openResolved() {
+      if (!this._discover || (this.url && this._attempt % 3 !== 2)) {
+        this._open();
+        return;
+      }
+      this._setState(this._attempt > 0 ? "reconnecting" : "connecting");
+      findServer(this._discover)
+        .then((info) => {
+          this.serverName = info.name || null;
+          if (!info.online || !info.server) throw new HGSError("server_offline", "the game server is offline right now", { retryable: true });
+          this.url = normalizeUrl(info.server);
+          this._open();
+        })
+        .catch((e) => {
+          const err = e instanceof HGSError ? e : new HGSError("network", "cannot find the server: " + e.message, { retryable: true });
+          if (this.url) return this._open(); // keep trying the last known address
+          this._fail(err);
+        });
     }
 
     _authPayload() {
@@ -387,7 +412,7 @@
     _scheduleReconnect(delay) {
       clearTimeout(this._timer);
       this._emit("hgs:reconnecting", { attempt: this._attempt, delayMs: Math.round(delay) });
-      this._timer = setTimeout(() => this._open(), delay);
+      this._timer = setTimeout(() => this._openResolved(), delay);
     }
 
     _fail(err) {
@@ -528,6 +553,145 @@
     }
   }
 
+  // ------------------------------------------------------------------ server discovery
+  /**
+   * Reads the address file the HGS owner publishes on GitHub ("owner/repo" or "owner/repo/path.json").
+   * Resolves to { server, online, name, updated }.
+   */
+  function findServer(spec) {
+    const parts = String(spec).split("/");
+    if (parts.length < 2) return Promise.reject(new HGSError("bad_config", "use github:owner/repo"));
+    const repo = parts[0] + "/" + parts[1];
+    const path = parts.length > 2 ? parts.slice(2).join("/") : "hgs-server.json";
+    const api = "https://api.github.com/repos/" + repo + "/contents/" + path + "?t=" + Date.now();
+    const raw = "https://raw.githubusercontent.com/" + repo + "/HEAD/" + path + "?t=" + Date.now();
+    const get = (url, headers) => fetch(url, { headers, cache: "no-store" }).then((r) => {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    });
+    // the API is always fresh; raw.githubusercontent.com is the fallback (it may be cached for a few minutes)
+    return get(HGS_DISCOVERY.api || api, { Accept: "application/vnd.github.raw+json" })
+      .catch(() => get(HGS_DISCOVERY.raw || raw, {}));
+  }
+  const HGS_DISCOVERY = { api: null, raw: null }; // tests can point these elsewhere
+
+  // ------------------------------------------------------------------ built-in login window
+  const UI_TEXT = {
+    uk: { login: "\u0412\u0445\u0456\u0434", register: "\u0420\u0435\u0454\u0441\u0442\u0440\u0430\u0446\u0456\u044f", name: "\u0406\u043c'\u044f", password: "\u041f\u0430\u0440\u043e\u043b\u044c", go: "\u0413\u0440\u0430\u0442\u0438", offline: "\u0421\u0435\u0440\u0432\u0435\u0440 \u0433\u0440\u0438 \u0437\u0430\u0440\u0430\u0437 \u0432\u0438\u043c\u043a\u043d\u0435\u043d\u043e. \u0421\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u043f\u0456\u0437\u043d\u0456\u0448\u0435.", retry: "\u0421\u043f\u0440\u043e\u0431\u0443\u0432\u0430\u0442\u0438 \u0449\u0435 \u0440\u0430\u0437", connecting: "\u041f\u0456\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043d\u044f\u2026", short: "\u041f\u0430\u0440\u043e\u043b\u044c \u2014 \u0449\u043e\u043d\u0430\u0439\u043c\u0435\u043d\u0448\u0435 6 \u0441\u0438\u043c\u0432\u043e\u043b\u0456\u0432" },
+    en: { login: "Log in", register: "Sign up", name: "Name", password: "Password", go: "Play", offline: "The game server is offline right now. Try again later.", retry: "Try again", connecting: "Connecting\u2026", short: "Password: at least 6 characters" },
+  };
+  const ERR_TEXT = {
+    uk: { unauthorized: "\u041d\u0435\u043f\u0440\u0430\u0432\u0438\u043b\u044c\u043d\u0435 \u0456\u043c'\u044f \u0430\u0431\u043e \u043f\u0430\u0440\u043e\u043b\u044c", name_taken: "\u0426\u0435 \u0456\u043c'\u044f \u0432\u0436\u0435 \u0437\u0430\u0439\u043d\u044f\u0442\u0435", rate_limited: "\u0417\u0430\u0431\u0430\u0433\u0430\u0442\u043e \u0441\u043f\u0440\u043e\u0431, \u0437\u0430\u0447\u0435\u043a\u0430\u0439\u0442\u0435 \u043a\u0456\u043b\u044c\u043a\u0430 \u0445\u0432\u0438\u043b\u0438\u043d", banned: "\u0414\u043e\u0441\u0442\u0443\u043f \u0437\u0430\u0431\u043b\u043e\u043a\u043e\u0432\u0430\u043d\u043e", forbidden: "\u0420\u0435\u0454\u0441\u0442\u0440\u0430\u0446\u0456\u044e \u0432\u0438\u043c\u043a\u043d\u0435\u043d\u043e \u0432\u043b\u0430\u0441\u043d\u0438\u043a\u043e\u043c \u0441\u0435\u0440\u0432\u0435\u0440\u0430" },
+    en: { unauthorized: "Wrong name or password", name_taken: "This name is taken", rate_limited: "Too many attempts, wait a few minutes", banned: "Access blocked", forbidden: "Registration is disabled" },
+  };
+
+  function overlay(lang) {
+    const t = UI_TEXT[lang] || UI_TEXT.en;
+    const box = document.createElement("div");
+    box.setAttribute("data-hgs-login", "");
+    box.style.cssText = "position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;background:rgba(10,12,16,.82);font:15px system-ui,sans-serif;color:#e6e8ee";
+    box.innerHTML =
+      '<form style="background:#171a21;border:1px solid #2a2f3a;border-radius:12px;padding:22px;width:min(320px,90vw);display:flex;flex-direction:column;gap:10px">' +
+      '<div style="display:flex;gap:6px"><button type="button" data-tab="login"></button><button type="button" data-tab="register"></button></div>' +
+      '<input name="u" autocomplete="username" maxlength="24" required>' +
+      '<input name="p" type="password" autocomplete="current-password" maxlength="128" required>' +
+      '<div data-msg style="min-height:1.2em;color:#ff5c5c;font-size:13px"></div>' +
+      '<button type="submit" data-go></button></form>';
+    const style = "padding:9px 10px;border-radius:7px;border:1px solid #2a2f3a;background:#0f1115;color:#e6e8ee;font:inherit";
+    box.querySelectorAll("input").forEach((i) => (i.style.cssText = style));
+    box.querySelector('[name="u"]').placeholder = t.name;
+    box.querySelector('[name="p"]').placeholder = t.password;
+    box.querySelector("[data-go]").textContent = t.go;
+    box.querySelector("[data-go]").style.cssText = style + ";background:#4f8cff;border-color:#4f8cff;color:#fff;font-weight:600;cursor:pointer";
+    box.querySelector('[data-tab="login"]').textContent = t.login;
+    box.querySelector('[data-tab="register"]').textContent = t.register;
+    return box;
+  }
+
+  /**
+   * One call for a game: finds the server, shows a login/sign-up window only when needed
+   * (the login is remembered), joins the room and resolves with a connected client.
+   *
+   *   const hgs = await HGS.start({ gameId: "my-game", server: "github:me/hgs-address", room: "lobby" });
+   *
+   * A ?hgs=ws://... parameter in the page address overrides `server` (handy for local tests).
+   */
+  function start(options) {
+    const o = Object.assign({ room: "lobby", lang: (typeof navigator !== "undefined" && /^uk|^ru/.test(navigator.language)) ? "uk" : "en" }, options || {});
+    const t = UI_TEXT[o.lang] || UI_TEXT.en;
+    const e = ERR_TEXT[o.lang] || ERR_TEXT.en;
+    const params = fromUrlParams();
+    const client = new Client({ serverUrl: params.serverUrl || o.server, gameId: o.gameId, storage: o.storage,
+      auth: params.invite ? { type: "invite", code: params.invite, name: params.name || "Player" } : null, debug: o.debug });
+    const room = params.room || o.room;
+    return new Promise((resolve) => {
+      let box = null;
+      const done = () => {
+        if (box) box.remove();
+        client.joinRoom(room).then(() => resolve(client), () => resolve(client));
+      };
+      const showOffline = () => {
+        if (!box) {
+          box = overlay(o.lang);
+          document.body.appendChild(box);
+        }
+        box.querySelector("form").innerHTML = '<div style="text-align:center;line-height:1.5">' + t.offline + '</div><button type="button" data-retry style="padding:9px;border-radius:7px;border:0;background:#4f8cff;color:#fff;font:inherit;cursor:pointer">' + t.retry + "</button>";
+        box.querySelector("[data-retry]").onclick = () => {
+          box.remove();
+          box = null;
+          attempt();
+        };
+      };
+      const showLogin = (message) => {
+        if (!box) {
+          box = overlay(o.lang);
+          document.body.appendChild(box);
+        }
+        let mode = "login";
+        const tabs = box.querySelectorAll("[data-tab]");
+        const paint = () => tabs.forEach((b) => {
+          const on = b.getAttribute("data-tab") === mode;
+          b.style.cssText = "flex:1;padding:8px;border-radius:7px;border:1px solid " + (on ? "#4f8cff" : "#2a2f3a") + ";background:" + (on ? "#1e2a44" : "transparent") + ";color:#e6e8ee;font:inherit;cursor:pointer";
+        });
+        tabs.forEach((b) => (b.onclick = () => { mode = b.getAttribute("data-tab"); paint(); }));
+        paint();
+        const msg = box.querySelector("[data-msg]");
+        msg.textContent = message || "";
+        box.querySelector("form").onsubmit = (ev) => {
+          ev.preventDefault();
+          const username = box.querySelector('[name="u"]').value.trim();
+          const password = box.querySelector('[name="p"]').value;
+          if (mode === "register" && password.length < 6) { msg.textContent = t.short; return; }
+          msg.style.color = "#8a91a0";
+          msg.textContent = t.connecting;
+          client._auth = { type: "account", username, password, register: mode === "register" };
+          client.forgetToken();
+          client.connect().then(done, (err) => {
+            msg.style.color = "#ff5c5c";
+            if (err.code === "server_offline") return showOffline();
+            msg.textContent = e[err.code] || err.message;
+          });
+        };
+      };
+      const attempt = () => {
+        if (!client.savedToken && !client._auth) {
+          // first visit: make sure the server is online before asking to log in
+          if (!client._discover) return showLogin();
+          return findServer(client._discover).then(
+            (info) => (info.online && info.server ? showLogin() : showOffline()),
+            () => showOffline());
+        }
+        client.connect().then(done, (err) => {
+          if (err.code === "server_offline") return showOffline();
+          client.forgetToken();
+          client._auth = null;
+          showLogin(err.code === "unauthorized" ? "" : (e[err.code] || err.message));
+        });
+      };
+      attempt();
+    });
+  }
+
   // ------------------------------------------------------------------ helpers
   function fromUrlParams(search) {
     const src = search !== undefined ? search : typeof location !== "undefined" ? location.search : "";
@@ -559,6 +723,9 @@
     Client,
     createClient: (options) => new Client(options),
     fromUrlParams,
+    findServer,
+    start,
+    _discovery: HGS_DISCOVERY,
     /** Shortcut for simple games: one global client. */
     connect(options) {
       if (defaultClient) defaultClient.disconnect();
