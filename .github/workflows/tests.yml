@@ -25,6 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
           pip install -e . --no-deps
+          python -m playwright install chromium
       - name: Tests
         env:
           QT_QPA_PLATFORM: offscreen

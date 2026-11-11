@@ -52,8 +52,8 @@
 
   "auth":  { "mode": "invite" },
   "rooms": { "max_rooms": 10, "max_players": 8, "allow_player_create": true, "empty_ttl_s": 300 },
-  "limits": { "max_message_bytes": 16384, "messages_per_s": 30, "memory_mb": 512, "cpu_percent": 50 },
-  "saves": { "enabled": true, "interval_s": 300, "keep": 10, "on_stop": true },
+  "limits": { "max_message_bytes": 16384, "messages_per_s": 30, "burst": 60, "memory_mb": 512 },
+  "saves": { "enabled": true, "interval_s": 300, "keep": 10, "on_stop": true, "load_on_start": true },
   "restart": { "policy": "on_crash", "max_restarts": 3, "window_s": 600 }
 }
 ```

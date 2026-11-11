@@ -10,7 +10,7 @@ import json
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from .protocol.client import msg
 
@@ -66,9 +66,10 @@ class Room:
         )
         return d
 
-    def broadcast(self, text: str, exclude: str | None = None) -> None:
+    def broadcast(self, text: str, exclude: "str | set[str] | None" = None) -> None:
+        skip = {exclude} if isinstance(exclude, str) else (exclude or set())
         for pid, s in list(self.players.items()):
-            if pid != exclude:
+            if pid not in skip:
                 s.send(text)
 
 
@@ -76,6 +77,15 @@ class RoomManager:
     def __init__(self, bus: "EventBus") -> None:
         self.bus = bus
         self._rooms: dict[str, dict[str, Room]] = {}
+        # listener(kind, room) with kind "created" | "closed"; set by the Server Manager
+        self.listener: Callable[[str, Room], None] | None = None
+
+    def _notify(self, kind: str, room: Room) -> None:
+        if self.listener is not None:
+            try:
+                self.listener(kind, room)
+            except Exception:
+                pass
 
     # -- queries --------------------------------------------------------------------
     def get(self, game_id: str, room_id: str) -> Room | None:
@@ -121,6 +131,7 @@ class RoomManager:
         )
         rooms[room_id] = room
         self.bus.publish("room.created", game_id=game_id, room=room.public())
+        self._notify("created", room)
         return room
 
     def join(self, session: "Session", room_id: str) -> Room:
@@ -180,12 +191,32 @@ class RoomManager:
             s.room_id = None
         room.players.clear()
         self.bus.publish("room.closed", game_id=game_id, room_id=room_id, reason=reason)
+        self._notify("closed", room)
         return room
 
     def close_all(self, game_id: str, reason: str) -> None:
-        for room_id in list(self._rooms.get(game_id, {})):
-            self.close(game_id, room_id, reason)
+        # The game itself is stopping: no per-room notifications to its adapter.
+        listener, self.listener = self.listener, None
+        try:
+            for room_id in list(self._rooms.get(game_id, {})):
+                self.close(game_id, room_id, reason)
+        finally:
+            self.listener = listener
         self._rooms.pop(game_id, None)
+
+    def update(self, game_id: str, room_id: str, *, status: str | None = None, params: dict | None = None,
+               max_players: int | None = None) -> Room | None:
+        room = self.get(game_id, room_id)
+        if room is None:
+            return None
+        if status in ("open", "locked"):
+            room.status = status
+        if isinstance(params, dict) and json_size(params) <= 4096:
+            room.params = params
+        if isinstance(max_players, int) and 1 <= max_players <= 1000:
+            room.max_players = max_players
+        self.bus.publish("room.updated", game_id=game_id, room=room.public())
+        return room
 
     def reap_empty(self, ttl_by_game: dict[str, int], now: float | None = None) -> list[Room]:
         """Close non-persistent rooms that stayed empty longer than the game's TTL."""

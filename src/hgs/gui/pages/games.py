@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from hgs.gui.theme.dark import RED
-from hgs.gui.widgets.common import Banner, Card, StateBadge, fmt_duration
+from hgs.gui.widgets.common import Banner, Card, StateBadge, fmt_bytes, fmt_duration
 
 if TYPE_CHECKING:
     from hgs.gui.core_client import CoreClient
@@ -72,8 +72,12 @@ class GameCard(Card):
         self.title.setText(g["name"])
         self.badge.set_state(g["state"])
         self.meta.setText(f"{g['id']} · {g['adapter']} · {g['mode']} · v{g['version']} · вхід: {g['auth_mode']}")
-        self.stats.setText(f"👥 гравців: {g['players_online']} · 🚪 кімнат: {g['rooms_open']} · "
-                           f"⏱ {fmt_duration(g['uptime_s'])} · перезапусків: {g['restarts']}")
+        stats = (f"👥 гравців: {g['players_online']} · 🚪 кімнат: {g['rooms_open']} · "
+                 f"⏱ {fmt_duration(g['uptime_s'])} · перезапусків: {g['restarts']}")
+        m = g.get("metrics") or {}
+        if m.get("memory_bytes") is not None:
+            stats += f"\nпроцес гри: CPU {m.get('cpu_percent', 0):.0f}% · RAM {fmt_bytes(m['memory_bytes'])} · PID {m.get('pid')}"
+        self.stats.setText(stats)
         self.error.setText(g["last_error"] or "")
         self.error.setVisible(bool(g["last_error"]))
         self._refresh_buttons()

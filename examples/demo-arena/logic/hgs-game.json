@@ -1,0 +1,10 @@
+{
+  "id": "demo-arena-logic",
+  "name": "Demo Arena (server logic)",
+  "version": "1.0.0",
+  "adapter": "html",
+  "backend": { "mode": "logic", "module": "server/logic.py", "class": "Game", "config": { "speed": 220 } },
+  "auth": { "mode": "open" },
+  "rooms": { "max_players": 16, "default_rooms": ["lobby"] },
+  "saves": { "enabled": true, "interval_s": 120, "keep": 5 }
+}

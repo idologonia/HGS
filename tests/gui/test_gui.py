@@ -62,7 +62,7 @@ def window(qapp, tmp_path, monkeypatch):
 
     data = tmp_path / "data"
     data.mkdir()
-    (data / "settings.json").write_text(json.dumps({"admin": {"port": 0}, "gateway": {"port": 0}}))
+    (data / "settings.json").write_text(json.dumps({"admin": {"port": 0}, "gateway": {"port": 0}, "worker_bus": {"port": 0}}))
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
     w = MainWindow(data)
     w.show()
@@ -140,3 +140,58 @@ def test_core_crash_shows_banner_and_restart_works(qapp, window):
     w.banner.action.click()
     wait_until(qapp, lambda: w._core_ready and w.client.events_connected, what="core restarted")
     assert not w.banner.isVisible()
+
+
+def test_gui_stays_responsive_under_load(qapp, window):
+    """100+ game messages per second and a live log stream must not freeze the window."""
+    from pathlib import Path
+
+    from websockets.sync.client import connect
+
+    w = window
+    root = Path(__file__).resolve().parents[2] / "examples" / "demo-arena" / "logic"
+    w.client.call("POST", "/games", {"path": str(root)})
+    wait_until(qapp, lambda: "demo-arena-logic" in w.games.cards, what="game card")
+    card = w.games.cards["demo-arena-logic"]
+    card.buttons["start"].click()
+    wait_until(qapp, lambda: card.game["state"] == "running", what="running")
+    card.buttons["logs"].click()  # live log view of the game
+    wait_until(qapp, lambda: "logic backend ready" in w.logs.view.toPlainText(), what="game log")
+
+    port = w.launcher.gateway_port
+    done = threading.Event()
+    sent = [0]
+
+    def spam(name: str) -> None:
+        with connect(f"ws://127.0.0.1:{port}/hgs/v1/ws", max_size=None) as ws:
+            seq = 1
+            ws.send(json.dumps({"v": 1, "t": "hello", "seq": seq,
+                                "d": {"game": "demo-arena-logic", "auth": {"type": "open", "name": name}}}))
+            ws.recv()
+            seq += 1
+            ws.send(json.dumps({"v": 1, "t": "room.join", "seq": seq, "id": "j", "d": {"room_id": "lobby"}}))
+            end = time.monotonic() + 3
+            while time.monotonic() < end:
+                seq += 1
+                ws.send(json.dumps({"v": 1, "t": "game", "seq": seq,
+                                    "d": {"e": "input", "d": {"dx": seq % 3 - 1, "dy": 0}}}))
+                sent[0] += 1
+                time.sleep(0.04)  # 25 msg/s per player, under the per-player limit
+                try:
+                    while True:
+                        ws.recv(timeout=0)  # drain game_state updates
+                except TimeoutError:
+                    pass
+
+    threads = [threading.Thread(target=spam, args=(f"Bot{i}",), daemon=True) for i in range(5)]
+    meter = StallMeter()
+    for t in threads:
+        t.start()
+    wait_until(qapp, lambda: card.game["players_online"] == 5, what="5 players")
+    wait_until(qapp, lambda: not any(t.is_alive() for t in threads), timeout=30, what="load finished")
+    meter.stop()
+    done.set()
+    assert sent[0] >= 300, sent[0]
+    assert meter.max_gap_ms < 500, f"GUI event loop stalled for {meter.max_gap_ms} ms"
+    wait_until(qapp, lambda: "Bot4 joined" in w.logs.view.toPlainText(), what="live log lines")
+    wait_until(qapp, lambda: "процес гри" in card.stats.text(), what="worker metrics on the card")

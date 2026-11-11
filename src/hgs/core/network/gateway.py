@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
@@ -63,6 +63,17 @@ ADAPTER_CALL_TIMEOUT_S = 5.0
 TRANSPORT_MAX_BYTES = 1024 * 1024 + 1024
 
 
+def sdk_path():
+    """Location of hgs.js: bundled with the package (builds) or in the repository (development)."""
+    from pathlib import Path
+
+    here = Path(__file__).resolve()
+    for candidate in (here.parents[2] / "static" / "hgs.js", here.parents[4] / "sdk" / "js" / "hgs.js"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 class Gateway:
     def __init__(self, core: "CoreApp") -> None:
         self.core = core
@@ -73,10 +84,18 @@ class Gateway:
                 WebSocketRoute("/hgs/v1/ws", self.ws_endpoint),
                 Route("/hgs/v1/health", self.health),
                 Route("/hgs/v1/info", self.info),
+                Route("/hgs/sdk/hgs.js", self.sdk),
             ]
         )
 
     # == HTTP ======================================================================
+    async def sdk(self, request: Request) -> Response:
+        path = sdk_path()
+        if path is None:
+            return JSONResponse({"error": "sdk_not_found"}, status_code=404)
+        return Response(path.read_bytes(), media_type="text/javascript; charset=utf-8",
+                        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"})
+
     async def health(self, request: Request) -> JSONResponse:
         return JSONResponse({"ok": True, "service": "hgs", "instance": self.instance_nonce})
 
@@ -92,8 +111,9 @@ class Gateway:
             if g is None:
                 return JSONResponse({"error": "game_not_found"}, status_code=404)
             out["game"] = {"id": g.game_id, "name": g.manifest.name, "running": self.core.servers.is_running(game_id),
-                           "auth_mode": g.manifest.auth.mode}
-        return JSONResponse(out)
+                           "auth_mode": g.manifest.auth.mode, "mode": (g.manifest.backend or {}).get("mode", "relay")}
+        # public, non-sensitive information: browsers on any site may read it
+        return JSONResponse(out, headers={"Access-Control-Allow-Origin": "*"})
 
     # == WebSocket =================================================================
     def _client_ip(self, ws: WebSocket) -> str:
@@ -208,6 +228,8 @@ class Gateway:
             "session_id": session.id,
             "resumed": False,
             "player": session.public(),
+            "game": {"id": manifest.id, "name": manifest.name, "version": manifest.version,
+                     "mode": (manifest.backend or {}).get("mode", "relay")},
             "server": {
                 "protocol": PROTOCOL_VERSION,
                 "heartbeat_s": 15,

@@ -23,10 +23,11 @@
 * Перевіряє: інтерпретатор у списку дозволених; точка входу знаходиться всередині директорії гри
   (після `realpath`, без `..` і символьних посилань назовні); директорія гри зареєстрована користувачем.
 * Запускає через `asyncio.create_subprocess_exec` (без `shell=True`), з `CREATE_NEW_PROCESS_GROUP`.
-* Додає процес до Job Object гри: ліміт пам'яті, ліміт CPU (%), `KILL_ON_JOB_CLOSE`.
+* Додає процес до Job Object гри: ліміт пам'яті, `KILL_ON_JOB_CLOSE`. CPU: процес гри отримує знижений пріоритет
+  (`BELOW_NORMAL`), щоб ПК лишався чуйним; жорсткий ліміт CPU у % — пізніше, якщо знадобиться.
 * Читає stdout/stderr построково → Logger (окремий файл гри) + Event Bus (для GUI).
-* Коректне завершення: повідомлення `shutdown` через Worker Protocol → очікування → `CTRL_BREAK_EVENT`
-  → очікування → `TerminateJobObject`.
+* Коректне завершення: повідомлення `w.shutdown` через Worker Protocol → очікування → `TerminateProcess`
+  → очікування → `TerminateJobObject` (усе дерево процесів).
 * Звичайні права користувача; HGS ніколи не просить прав адміністратора.
 
 ## 2.3. Network Manager (`core/network/`)

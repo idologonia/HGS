@@ -60,8 +60,36 @@ class GameContext:
         self.paths = paths
         self.log = logger
 
+    # services (set by the Server Manager)
+    @property
+    def worker_bus(self):
+        return self._m.worker_bus
+
+    @property
+    def saves(self):
+        return self._m.saves
+
+    @property
+    def allowlist(self):
+        return self._m.allowlist
+
+    def list_rooms(self) -> list:
+        return self._m.rooms.list(self.game_id)
+
+    def update_room(self, room_id: str, **changes: Any) -> None:
+        self._m.rooms.update(self.game_id, room_id, **changes)
+
+    def close_room(self, room_id: str, reason: str) -> None:
+        self._m.rooms.close(self.game_id, room_id, reason)
+
+    def kick(self, room_id: str, player_id: str, reason: str) -> bool:
+        room = self._m.rooms.get(self.game_id, room_id)
+        if room is None or player_id not in room.players or self._m.kick is None:
+            return False
+        return self._m.kick(self.game_id, player_id, reason)
+
     def send_to_room(self, room_id: str, event: str, data: Any, *, sender: str | None = None,
-                     exclude: str | None = None) -> None:
+                     exclude: "str | set[str] | None" = None) -> None:
         room = self._m.rooms.get(self.game_id, room_id)  # lookup is scoped to this game
         if room is None:
             return
@@ -116,6 +144,9 @@ class ServerManager:
         rooms: "RoomManager",
         sessions: "SessionManager",
         logs: "LogManager",
+        worker_bus: Any = None,
+        saves: Any = None,
+        allowlist: Any = None,
     ) -> None:
         self.data = data
         self.db = db
@@ -124,7 +155,28 @@ class ServerManager:
         self.rooms = rooms
         self.sessions = sessions
         self.logs = logs
+        self.worker_bus = worker_bus
+        self.saves = saves
+        self.allowlist = allowlist
+        self.kick = None  # set by the core once the gateway exists
         self.games: dict[str, GameServer] = {}
+        rooms.listener = self._on_room_event
+
+    def _on_room_event(self, kind: str, room: Any) -> None:
+        game = self.games.get(room.game_id)
+        if game is None or game.adapter is None or game.state != AdapterState.RUNNING:
+            return
+        from hgs.adapters.base import RoomRef
+
+        ref = RoomRef(room.room_id, room.name, dict(room.params))
+        adapter = game.adapter
+
+        async def _call() -> None:
+            try:
+                await asyncio.wait_for(adapter.handle_room_event(ref, kind), CALL_TIMEOUT_S)
+            except Exception as exc:
+                log.error("game %s: room event handler failed: %s", room.game_id, _describe(exc))
+        asyncio.get_running_loop().create_task(_call())
 
     # == registry ==================================================================
     async def load_registry(self) -> None:
@@ -361,10 +413,15 @@ class ServerManager:
 
     def game_view(self, game: GameServer) -> dict[str, Any]:
         m = game.manifest
-        metrics = {}
+        metrics: dict[str, Any] = {}
         if game.adapter is not None:
             try:
-                metrics = game.adapter.get_metrics().custom
+                am = game.adapter.get_metrics()
+                metrics = dict(am.custom)
+                if am.cpu_percent is not None:
+                    metrics["cpu_percent"] = am.cpu_percent
+                if am.memory_bytes is not None:
+                    metrics["memory_bytes"] = am.memory_bytes
             except Exception:
                 metrics = {}
         return {

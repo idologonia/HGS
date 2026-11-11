@@ -3,7 +3,7 @@
 Listeners:
 * Admin API  — 127.0.0.1 only (GUI);
 * Gateway    — players (127.0.0.1 in "local" mode, 0.0.0.0 in "lan" mode);
-* (Stage 3) Worker Bus — 127.0.0.1, game worker processes.
+* Worker Bus — 127.0.0.1 only, game worker processes.
 """
 
 from __future__ import annotations
@@ -32,6 +32,9 @@ from hgs.core.db.database import Database
 from hgs.core.events import EventBus
 from hgs.core.logging_setup import LogManager, register_secret
 from hgs.core.network.gateway import TRANSPORT_MAX_BYTES, Gateway
+from hgs.core.network.worker_bus import WorkerBus
+from hgs.core.process_supervisor import AllowList
+from hgs.core.saves import SaveManager
 from hgs.core.resources import ResourceMonitor
 from hgs.core.rooms import RoomManager
 from hgs.core.security_log import SecurityJournal
@@ -106,18 +109,26 @@ class CoreApp:
         self.auth = AuthManager(self.db, self.journal)
         self.sessions = SessionManager()
         self.rooms = RoomManager(self.bus)
+        self.worker_bus = WorkerBus()
+        self.saves = SaveManager(self.db, self.paths)
+        self.allowlist = AllowList()
         self.servers = ServerManager(data=self.paths, db=self.db, bus=self.bus, registry=self.registry,
-                                     rooms=self.rooms, sessions=self.sessions, logs=self.logs)
+                                     rooms=self.rooms, sessions=self.sessions, logs=self.logs,
+                                     worker_bus=self.worker_bus, saves=self.saves, allowlist=self.allowlist)
         await self.servers.load_registry()
         self.gateway = Gateway(self)
+        self.servers.kick = self.gateway.kick
         self.resources = ResourceMonitor(self.bus, self.settings.resources.metrics_interval_s)
 
         admin_sock = _bind("127.0.0.1", self.settings.admin.port)
         gw_sock = _bind(self.settings.bind_host(), self.settings.gateway.port)
+        wb_sock = _bind("127.0.0.1", self.settings.worker_bus.port)
         self.admin_port = admin_sock.getsockname()[1]
         self.gateway_port = gw_sock.getsockname()[1]
+        self.worker_bus.port = wb_sock.getsockname()[1]
         await self._serve(create_admin_app(self), admin_sock, "admin")
         await self._serve(self.gateway.app, gw_sock, "gateway")
+        await self._serve(self.worker_bus.app, wb_sock, "worker-bus")
 
         self.resources.start()
         self._bg.append(asyncio.get_running_loop().create_task(self._reaper(), name="room-reaper"))

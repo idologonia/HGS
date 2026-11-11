@@ -1,0 +1,9 @@
+{
+  "id": "demo-arena",
+  "name": "Demo Arena (relay)",
+  "version": "1.0.0",
+  "adapter": "html",
+  "backend": { "mode": "relay" },
+  "auth": { "mode": "open" },
+  "rooms": { "max_players": 16, "default_rooms": ["lobby"] }
+}

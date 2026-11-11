@@ -30,6 +30,10 @@ class GatewaySettings(_Strict):
     hello_timeout_s: float = Field(5.0, gt=0, le=60)
 
 
+class WorkerBusSettings(_Strict):
+    port: int = Field(8766, ge=0, le=65535)
+
+
 class LogSettings(_Strict):
     max_file_mb: int = Field(10, ge=1, le=1000)
     keep_files: int = Field(5, ge=1, le=100)
@@ -44,6 +48,7 @@ class Settings(_Strict):
     server_name: str = Field("Home Game Server", min_length=1, max_length=64)
     admin: AdminSettings = AdminSettings()
     gateway: GatewaySettings = GatewaySettings()
+    worker_bus: WorkerBusSettings = WorkerBusSettings()
     logs: LogSettings = LogSettings()
     resources: ResourceSettings = ResourceSettings()
 

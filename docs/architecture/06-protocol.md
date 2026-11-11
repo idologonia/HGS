@@ -129,7 +129,10 @@ sequenceDiagram
 { "v":1, "t":"w.hello", "d":{ "token":"<HGS_WORKER_TOKEN>", "game_id":"tank-arena", "api":1, "sdk":"hgs_sdk-py/1.0.0" } }
 ```
 
-Ядро відповідає `w.welcome {config, rooms}`. Один токен — одне підключення.
+Ядро надсилає запит `w.welcome {game_id, config, rooms, save}` (`save` — останній знімок стану або `null`).
+Воркер викликає `on_load`/`on_start` і відповідає `w.reply {ready: true}` — після цього гра в стані `RUNNING`
+(або `{ready: false, error}`). Один токен — одне підключення. Відповідь на будь-який запит з `id` —
+`{"t": "w.reply", "re": <id>, "d": ...}`.
 
 ### Ядро → воркер
 
@@ -148,7 +151,6 @@ sequenceDiagram
 
 | `t` | `d` | Опис |
 |-----|-----|------|
-| `w.ready` | `{}` | гра готова приймати гравців (після цього стан `RUNNING`) |
 | `w.send` | `{room_id, e, d, to?:[pid], except?:[pid]}` | надіслати подію гравцям кімнати |
 | `w.room.update` | `{room_id, status?, params?, max_players?}` | змінити кімнату |
 | `w.room.close` | `{room_id, reason}` | закрити кімнату |

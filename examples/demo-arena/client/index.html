@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HGS Demo Arena</title>
+<style>
+  :root { --bg:#0f1115; --surface:#171a21; --border:#2a2f3a; --text:#e6e8ee; --muted:#8a91a0; --green:#3ecf8e; --red:#ff5c5c; --yellow:#f2c94c; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px "Segoe UI", system-ui, sans-serif; }
+  header { display:flex; gap:16px; align-items:center; padding:10px 16px; background:var(--surface); border-bottom:1px solid var(--border); flex-wrap:wrap; }
+  header b { letter-spacing:1px; }
+  #status { font-weight:600; }
+  .muted { color:var(--muted); }
+  main { display:flex; gap:16px; padding:16px; flex-wrap:wrap; }
+  canvas { background:#12151b; border:1px solid var(--border); border-radius:8px; max-width:100%; }
+  aside { min-width:200px; }
+  ul { list-style:none; padding:0; margin:8px 0; }
+  li { padding:4px 0; }
+</style>
+</head>
+<body>
+<header>
+  <b>HGS DEMO ARENA</b>
+  <span id="status" class="muted">connecting…</span>
+  <span class="muted">mode: <span id="mode">—</span></span>
+  <span class="muted">room: <span id="room">—</span></span>
+  <span class="muted">Рух: стрілки або WASD</span>
+</header>
+<main>
+  <canvas id="c" width="800" height="500"></canvas>
+  <aside>
+    <b>Гравці</b>
+    <ul id="players"></ul>
+    <div class="muted" id="joins"></div>
+  </aside>
+</main>
+<!-- In your game repository, keep a copy of hgs.js next to your game files. -->
+<script src="../../../sdk/js/hgs.js"></script>
+<script>
+"use strict";
+// Infrastructure test for HGS: synchronized player positions.
+const W = 800, H = 500, R = 14, SPEED = 220;
+const params = HGS.fromUrlParams();
+const q = new URLSearchParams(location.search);
+const gameId = q.get("game") || "demo-arena";
+const myName = params.name || "Player" + Math.floor(Math.random() * 1000);
+const auth = params.invite ? { type: "invite", code: params.invite, name: myName } : { type: "open", name: myName };
+
+const hgs = HGS.createClient({ serverUrl: params.serverUrl || "ws://127.0.0.1:8765", gameId, auth, storage: q.get("storage") || "localStorage" });
+const others = new Map();  // relay mode: id -> {x, y, name}
+let serverPlayers = [];     // logic mode: positions from the server
+let me = { x: 100 + Math.random() * 600, y: 100 + Math.random() * 300 };
+const keys = { up: false, down: false, left: false, right: false };
+let mode = null;
+
+const $ = (id) => document.getElementById(id);
+function setStatus(text, color) { $("status").textContent = text; $("status").style.color = color || ""; }
+
+hgs.on("hgs:state", ({ state }) => {
+  const colors = { connected: "var(--green)", failed: "var(--red)", reconnecting: "var(--yellow)" };
+  setStatus(state, colors[state]);
+});
+hgs.on("hgs:error", (e) => setStatus("error: " + e.message, "var(--red)"));
+hgs.on("hgs:server_shutdown", (d) => setStatus("server stopping in " + d.graceS + " s", "var(--yellow)"));
+hgs.on("hgs:room_joined", ({ room }) => { $("room").textContent = room.name; others.clear(); sendPos(true); renderList(); });
+hgs.on("hgs:player_joined", () => { sendPos(true); renderList(); });
+hgs.on("hgs:player_left", ({ player }) => { others.delete(player.id); renderList(); });
+
+// relay mode: every client owns its position and shares it
+hgs.on("pos", (d, meta) => {
+  if (!d || typeof d.x !== "number" || typeof d.y !== "number") return;
+  const p = (hgs.room && hgs.room.players.find((pl) => pl.id === meta.from)) || {};
+  others.set(meta.from, { x: d.x, y: d.y, name: p.name || "?" });
+});
+// logic mode: the server owns all positions
+hgs.on("game_state", (d) => { serverPlayers = d.players || []; $("joins").textContent = "Всього входів: " + d.total_joins; });
+
+let lastSent = 0, lastSentX = null, lastSentY = null;
+function sendPos(force) {
+  if (mode !== "relay" || hgs.state !== "connected" || !hgs.room) return;
+  const now = performance.now();
+  if (!force && (now - lastSent < 50 || (me.x === lastSentX && me.y === lastSentY))) return;
+  lastSent = now; lastSentX = me.x; lastSentY = me.y;
+  hgs.send("pos", { x: Math.round(me.x), y: Math.round(me.y) });
+}
+
+let lastInput = "";
+function sendInput() {
+  if (mode !== "logic" || hgs.state !== "connected" || !hgs.room) return;
+  const dx = (keys.right ? 1 : 0) - (keys.left ? 1 : 0), dy = (keys.down ? 1 : 0) - (keys.up ? 1 : 0);
+  const key = dx + "," + dy;
+  if (key === lastInput) return;
+  lastInput = key;
+  hgs.send("input", { dx, dy });
+}
+
+const KEYMAP = { ArrowUp: "up", KeyW: "up", ArrowDown: "down", KeyS: "down", ArrowLeft: "left", KeyA: "left", ArrowRight: "right", KeyD: "right" };
+addEventListener("keydown", (e) => { if (KEYMAP[e.code]) { keys[KEYMAP[e.code]] = true; e.preventDefault(); sendInput(); } });
+addEventListener("keyup", (e) => { if (KEYMAP[e.code]) { keys[KEYMAP[e.code]] = false; sendInput(); } });
+addEventListener("blur", () => { for (const k in keys) keys[k] = false; sendInput(); });
+
+function renderList() {
+  const names = hgs.room ? hgs.room.players.map((p) => p.name + (hgs.player && p.id === hgs.player.id ? " (ви)" : "")) : [];
+  $("players").innerHTML = "";
+  for (const n of names) { const li = document.createElement("li"); li.textContent = n; $("players").appendChild(li); }
+}
+
+const ctx = $("c").getContext("2d");
+function circle(x, y, color, label) {
+  ctx.beginPath(); ctx.arc(x, y, R, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
+  ctx.fillStyle = "#e6e8ee"; ctx.font = "12px sans-serif"; ctx.textAlign = "center"; ctx.fillText(label, x, y - R - 6);
+}
+let prev = performance.now();
+function frame(now) {
+  const dt = Math.min(0.1, (now - prev) / 1000); prev = now;
+  ctx.clearRect(0, 0, W, H);
+  if (mode === "relay") {
+    me.x = Math.max(R, Math.min(W - R, me.x + ((keys.right ? 1 : 0) - (keys.left ? 1 : 0)) * SPEED * dt));
+    me.y = Math.max(R, Math.min(H - R, me.y + ((keys.down ? 1 : 0) - (keys.up ? 1 : 0)) * SPEED * dt));
+    sendPos(false);
+    for (const [, o] of others) circle(o.x, o.y, "#b67dff", o.name);
+    circle(me.x, me.y, "#4f8cff", myName);
+  } else if (mode === "logic") {
+    for (const p of serverPlayers) circle(p.x, p.y, p.color, p.name + (hgs.player && p.id === hgs.player.id ? " (ви)" : ""));
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// Test hook (used by HGS automated tests).
+window.demo = {
+  hgs,
+  get mode() { return mode; },
+  positions() {
+    if (mode === "relay") {
+      const out = { [hgs.player.id]: { x: Math.round(me.x), y: Math.round(me.y) } };
+      for (const [id, o] of others) out[id] = { x: o.x, y: o.y };
+      return out;
+    }
+    const out = {};
+    for (const p of serverPlayers) out[p.id] = { x: p.x, y: p.y };
+    return out;
+  },
+};
+
+hgs.connect()
+  .then(() => { mode = hgs.game ? hgs.game.mode : "relay"; $("mode").textContent = mode; return hgs.joinRoom(params.room || "lobby"); })
+  .then(renderList)
+  .catch((e) => setStatus("cannot connect: " + e.message, "var(--red)"));
+</script>
+</body>
+</html>

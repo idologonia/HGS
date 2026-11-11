@@ -120,6 +120,7 @@ def make_settings(**gateway: Any) -> Settings:
     s = Settings()
     s.admin.port = 0
     s.gateway.port = 0
+    s.worker_bus.port = 0
     for k, v in gateway.items():
         setattr(s.gateway, k, v)
     return s

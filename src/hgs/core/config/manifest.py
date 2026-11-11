@@ -65,6 +65,16 @@ class LimitsSection(_Strict):
     messages_per_s: float = Field(30, gt=0, le=1000)
     burst: int = Field(60, ge=1, le=10000)
     room_state_bytes: int = Field(65536, ge=1024, le=1024 * 1024)
+    # Memory limit for the game's worker process tree (Windows Job Object). None = no limit.
+    memory_mb: int | None = Field(512, ge=32, le=65536)
+
+
+class SavesSection(_Strict):
+    enabled: bool = True
+    interval_s: int = Field(300, ge=0, le=86400)  # 0 = no periodic saves
+    keep: int = Field(10, ge=1, le=1000)
+    on_stop: bool = True
+    load_on_start: bool = True
 
 
 class RestartSection(_Strict):
@@ -85,6 +95,7 @@ class GameManifest(_Strict):
     auth: AuthSection = AuthSection()
     rooms: RoomsSection = RoomsSection()
     limits: LimitsSection = LimitsSection()
+    saves: SavesSection = SavesSection()
     restart: RestartSection = RestartSection()
 
 
