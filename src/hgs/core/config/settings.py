@@ -77,6 +77,8 @@ class Settings(_Strict):
     gateway: GatewaySettings = GatewaySettings()
     worker_bus: WorkerBusSettings = WorkerBusSettings()
     network: NetworkSettings = NetworkSettings()
+    # Programs outside game folders that the owner approved for starting game servers.
+    allowed_programs: list[str] = Field(default_factory=list, max_length=100)
     logs: LogSettings = LogSettings()
     resources: ResourceSettings = ResourceSettings()
 

@@ -1,0 +1,16 @@
+{
+  "id": "py-chat",
+  "name": "Python Chat (standalone)",
+  "version": "1.0.0",
+  "adapter": "python",
+  "backend": {
+    "mode": "standalone",
+    "entry": "server/main.py",
+    "python": "auto",
+    "args": ["--port", "{port}"],
+    "port": "auto",
+    "ready": { "type": "tcp", "timeout_s": 20 },
+    "proxy": { "require_login": false }
+  },
+  "auth": { "mode": "invite" }
+}

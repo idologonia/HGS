@@ -117,7 +117,7 @@ class CoreApp:
         self.rooms = RoomManager(self.bus)
         self.worker_bus = WorkerBus()
         self.saves = SaveManager(self.db, self.paths)
-        self.allowlist = AllowList()
+        self.allowlist = AllowList(self.settings.allowed_programs)
         self.servers = ServerManager(data=self.paths, db=self.db, bus=self.bus, registry=self.registry,
                                      rooms=self.rooms, sessions=self.sessions, logs=self.logs,
                                      worker_bus=self.worker_bus, saves=self.saves, allowlist=self.allowlist)
@@ -259,6 +259,31 @@ class CoreApp:
         if hasattr(self, "logs"):
             self.logs.close()
         self._lock.release()
+
+    # == allowlist ===================================================================
+    def _save_settings(self) -> None:
+        if not self.settings_is_override:
+            atomic_write_json(self.paths.settings, self.settings.model_dump(exclude_none=True))
+
+    async def allow_program(self, path: str) -> list[str]:
+        p = Path(path).expanduser()
+        if not p.is_file():
+            raise ValueError(f"file not found: {path}")
+        resolved = str(p.resolve())
+        if resolved not in self.settings.allowed_programs:
+            self.settings.allowed_programs.append(resolved)
+            self.allowlist.add(resolved)
+            self._save_settings()
+            log.warning("program approved for running game servers: %s", resolved)
+        return self.settings.allowed_programs
+
+    async def disallow_program(self, path: str) -> list[str]:
+        resolved = str(Path(path).expanduser().resolve())
+        self.settings.allowed_programs = [p for p in self.settings.allowed_programs if p != resolved]
+        self.allowlist = AllowList(self.settings.allowed_programs)
+        self.servers.allowlist = self.allowlist
+        self._save_settings()
+        return self.settings.allowed_programs
 
     # == views =====================================================================
     def admin_allowed_hosts(self) -> set[str]:

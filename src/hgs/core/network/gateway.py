@@ -15,6 +15,8 @@ import secrets
 import time
 from typing import TYPE_CHECKING, Any
 
+import websockets
+
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -87,6 +89,8 @@ class Gateway:
         self.app = Starlette(
             routes=[
                 WebSocketRoute("/hgs/v1/ws", self.ws_endpoint),
+                WebSocketRoute("/hgs/v1/proxy/{game_id}", self.proxy_endpoint),
+                WebSocketRoute("/hgs/v1/proxy/{game_id}/{path:path}", self.proxy_endpoint),
                 Route("/hgs/v1/health", self.health),
                 Route("/hgs/v1/info", self.info),
                 Route("/hgs/sdk/hgs.js", self.sdk),
@@ -415,16 +419,26 @@ class Gateway:
             room = core.rooms.get(s.game_id, p.room_id)
             if room is None:
                 raise RoomError("room_not_found", "room not found")
-            decision = await self._adapter_call(s, "handle_connection", self._pref(s), self._rref(room))
-            if decision is None:
-                raise RoomError("internal", "game server error")
-            if not decision.accept:
-                raise RoomError("forbidden", decision.reason or "join rejected by the game")
-            if s.room_id and s.room_id != room.room_id:
-                await self._leave_room(s, "switched_room")
-            room = core.rooms.join(s, room.room_id)
-            s.send(reply_ok(req_id, {"room": room.public()}))
-            s.send(msg("room.joined", core.rooms.joined_payload(room)))
+            if s.player_id in room.players:
+                s.send(reply_ok(req_id, {"room": room.public()}))
+                s.send(msg("room.joined", core.rooms.joined_payload(room)))
+                return
+            room.pending[s.player_id] = []
+            try:
+                decision = await self._adapter_call(s, "handle_connection", self._pref(s), self._rref(room))
+                if decision is None:
+                    raise RoomError("internal", "game server error")
+                if not decision.accept:
+                    raise RoomError("forbidden", decision.reason or "join rejected by the game")
+                if s.room_id and s.room_id != room.room_id:
+                    await self._leave_room(s, "switched_room")
+                room = core.rooms.join(s, room.room_id)
+                s.send(reply_ok(req_id, {"room": room.public()}))
+                s.send(msg("room.joined", core.rooms.joined_payload(room)))
+                for text in room.pending.get(s.player_id, []):
+                    s.send(text)
+            finally:
+                room.pending.pop(s.player_id, None)
         elif t == "room.leave":
             await self._leave_room(s, "left")
             s.send(reply_ok(req_id))
@@ -508,10 +522,159 @@ class Gateway:
         log.info("player %s (%s) disconnected from %s", s.name, s.player_id, s.game_id)
         self.core.bus.publish("player.disconnected", game_id=s.game_id, player=s.public(), code=s.close_code)
 
+    # == proxy to standalone game servers ===========================================
+    async def proxy_endpoint(self, ws: WebSocket) -> None:
+        """Forward a WebSocket to a game's own server (python/process adapters, mode "standalone").
+
+        HGS applies its limits (connections per IP, message size and rate, allowed origins) and,
+        if the game asks for it (backend.proxy.require_login), an HGS login as the first message.
+        """
+        core = self.core
+        game_id = ws.path_params["game_id"]
+        ip = self._client_ip(ws)
+        if core.sessions.ip_connections(ip) >= core.settings.gateway.max_connections_per_ip:
+            await ws.close(code=1008)
+            return
+        game = core.servers.games.get(game_id)
+        adapter = game.adapter if game and core.servers.is_running(game_id) else None
+        target = adapter.proxy_target() if adapter is not None and hasattr(adapter, "proxy_target") else None
+        origin = ws.headers.get("origin")
+        allowed = game.manifest.client.allowed_origins if game else []
+        core.sessions.ip_acquire(ip)
+        session: Session | None = None
+        upstream = None
+        try:
+            await ws.accept()
+            if target is None:
+                await ws.close(code=CLOSE_GAME_STOPPED, reason="game server is not running")
+                return
+            if allowed and origin is not None and origin.lower().rstrip("/") not in allowed:
+                await core.journal.record("origin_rejected", game_id=game_id, ip=ip, origin=origin[:200])
+                await ws.close(code=CLOSE_KICKED, reason="origin not allowed")
+                return
+            port, require_login = target
+            manifest = game.manifest
+            if require_login:
+                player = await self._proxy_login(ws, game_id, manifest, ip)
+                if player is None:
+                    return
+                pid, name = player.player_id, player.name
+            else:
+                pid, name = "g_" + secrets.token_hex(5), "guest"
+            limits = manifest.limits
+            session = Session(game_id=game_id, player_id=pid, name=name, ip=ip, rate=limits.messages_per_s,
+                              burst=limits.burst, max_message_bytes=limits.max_message_bytes)
+
+            async def _close(code: int, reason: str) -> None:
+                if ws.application_state == WebSocketState.CONNECTED:
+                    await ws.close(code=code, reason=reason)
+
+            session.proxied = True
+            session.attach(ws.send_text, _close)
+            old = core.sessions.add(session)
+            if old is not None:
+                old.close(CLOSE_REPLACED, "connected from another place")
+            path = ws.path_params.get("path", "")
+            query = ws.url.query
+            url = f"ws://127.0.0.1:{port}/{path}" + (f"?{query}" if query else "")
+            try:
+                upstream = await websockets.connect(url, max_size=TRANSPORT_MAX_BYTES, open_timeout=5, proxy=None,
+                                                    ping_interval=None)
+            except Exception as exc:
+                adapter.ctx.log.warning("proxy: cannot connect to the game server: %s", exc)
+                await ws.close(code=1011, reason="game server is not answering")
+                return
+            core.bus.publish("player.connected", game_id=game_id, player=session.public(), ip=ip, proxied=True)
+            await self._pump(ws, upstream, session)
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            log.exception("proxy error (game %s, ip %s)", game_id, ip)
+        finally:
+            core.sessions.ip_release(ip)
+            if upstream is not None:
+                await upstream.close()
+            if session is not None:
+                session.cleaned = True
+                session.close(1000, "bye")
+                core.sessions.remove(session)
+                await session.wait_closed(2.0)
+                core.bus.publish("player.disconnected", game_id=game_id, player=session.public(), code=session.close_code)
+
+    async def _proxy_login(self, ws: WebSocket, game_id: str, manifest: Any, ip: str) -> PlayerInfo | None:
+        try:
+            message = await asyncio.wait_for(ws.receive(), self.core.settings.gateway.hello_timeout_s)
+            env = parse_frame(message.get("text") or "", HELLO_MAX_BYTES)
+            if env.t != "hello":
+                raise ProtocolError("bad_request", "first message must be 'hello'")
+            hello = parse_hello(env.d)
+            if hello.game != game_id or isinstance(hello.auth, AuthResume):
+                raise ProtocolError("bad_request", "wrong game or login type")
+            player, token = await self._authenticate(game_id, manifest, hello.auth, ip)
+        except asyncio.TimeoutError:
+            await self._send_and_close(ws, msg("auth_error", {"code": "timeout", "message": "hello not received"}),
+                                       CLOSE_HELLO_TIMEOUT)
+            return None
+        except (ProtocolError, AuthError) as exc:
+            await self._send_and_close(ws, msg("auth_error", {"code": exc.code, "message": exc.message}), CLOSE_UNAUTHORIZED)
+            return None
+        welcome: dict[str, Any] = {"player": {"id": player.player_id, "name": player.name}, "proxied": True}
+        if token:
+            welcome["player_token"] = token
+        await ws.send_text(msg("welcome", welcome))
+        return player
+
+    async def _pump(self, ws: WebSocket, upstream: Any, s: Session) -> None:
+        async def client_to_game() -> None:
+            denied = 0
+            while not s.closed:
+                m = await ws.receive()
+                if m["type"] == "websocket.disconnect":
+                    return
+                data = m.get("text") if m.get("text") is not None else m.get("bytes")
+                if data is None:
+                    continue
+                size = len(data.encode("utf-8")) if isinstance(data, str) else len(data)
+                if size > s.max_message_bytes:
+                    await self.core.journal.record("message_too_large", game_id=s.game_id, ip=s.ip)
+                    s.close(CLOSE_TOO_LARGE, "message too large")
+                    return
+                if not s.bucket.allow():
+                    denied += 1
+                    if denied > s.bucket.burst:
+                        await self.core.journal.record("flood", game_id=s.game_id, ip=s.ip)
+                        s.close(CLOSE_FLOOD, "too many messages")
+                        return
+                    continue  # over the rate: dropped
+                denied = max(0, denied - 1)
+                s.messages_in += 1
+                s.last_activity = time.time()
+                await upstream.send(data)
+
+        async def game_to_client() -> None:
+            async for data in upstream:
+                if s.closed:
+                    return
+                if isinstance(data, bytes):
+                    await ws.send_bytes(data)
+                else:
+                    await ws.send_text(data)
+                s.messages_out += 1
+            s.close(1000, "game server closed the connection")
+
+        tasks = [asyncio.create_task(client_to_game()), asyncio.create_task(game_to_client())]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     def kick(self, game_id: str, player_id: str, reason: str) -> bool:
         s = self.core.sessions.get_player(game_id, player_id)
         if s is None:
             return False
-        s.send(msg("kicked", {"reason": reason}))
+        if not s.proxied:
+            s.send(msg("kicked", {"reason": reason}))
         s.close(CLOSE_KICKED, reason)  # a detached session is cleaned up through on_dead
         return True

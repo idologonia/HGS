@@ -42,6 +42,9 @@ class Room:
     players: dict[str, "Session"] = field(default_factory=dict)
     state: Any = None  # shared room state (relay mode)
     host: str | None = None
+    # messages the game sent to a player while that player's join was being decided;
+    # delivered right after the join succeeds
+    pending: dict[str, list[str]] = field(default_factory=dict)
 
     def public(self) -> dict[str, Any]:
         return {

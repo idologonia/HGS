@@ -11,8 +11,8 @@ import time
 import traceback
 from typing import Any
 
-import websockets
 
+from ._ws import ConnectionClosed, WebSocketClient
 from .logic import GameLogic, Player, Room
 
 API_VERSION = 1
@@ -72,34 +72,34 @@ class Connection:
 
     # -- main loop ---------------------------------------------------------------
     async def run(self) -> int:
-        async with websockets.connect(self.url, max_size=2 * 1024 * 1024, ping_interval=20, ping_timeout=20,
-                                      proxy=None) as ws:
-            self._ws = ws
-            await ws.send(json.dumps({"v": 1, "t": "w.hello", "d": {"token": self.token, "game_id": self.game_id,
-                                                                     "api": API_VERSION, "sdk": "hgs_sdk-py/1.0.0"}}))
-            writer = asyncio.create_task(self._writer())
-            try:
-                async for raw in ws:
-                    try:
-                        frame = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    stop = await self._handle(frame.get("t"), frame.get("d") or {}, frame.get("id"))
-                    if stop:
-                        break
-                # flush pending messages before closing
-                while not self._out.empty():
-                    await asyncio.sleep(0.01)
-                    if writer.done():
-                        break
-            except websockets.ConnectionClosed:
-                if self.exit_code == 0:
-                    print("hgs_sdk: connection to HGS core lost, exiting", file=sys.stderr)
-                    self.exit_code = 3
-            finally:
-                writer.cancel()
-                if self._tick_task:
-                    self._tick_task.cancel()
+        ws = await WebSocketClient.connect(self.url)
+        self._ws = ws
+        await ws.send(json.dumps({"v": 1, "t": "w.hello", "d": {"token": self.token, "game_id": self.game_id,
+                                                                 "api": API_VERSION, "sdk": "hgs_sdk-py/1.0.0"}}))
+        writer = asyncio.create_task(self._writer())
+        try:
+            while True:
+                raw = await ws.recv()
+                try:
+                    frame = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                stop = await self._handle(frame.get("t"), frame.get("d") or {}, frame.get("id"))
+                if stop:
+                    break
+            # flush pending messages before closing
+            while not self._out.empty() and not writer.done():
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            await ws.close()
+        except ConnectionClosed:
+            if self.exit_code == 0:
+                print("hgs_sdk: connection to HGS core lost, exiting", file=sys.stderr)
+                self.exit_code = 3
+        finally:
+            writer.cancel()
+            if self._tick_task:
+                self._tick_task.cancel()
         return self.exit_code
 
     async def _call(self, name: str, *args: Any) -> Any:

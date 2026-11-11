@@ -32,6 +32,15 @@ _STATUS = {"not_found": 404, "conflict": 409, "bad_request": 400, "forbidden": 4
 
 class AddGame(BaseModel):
     path: str = Field(min_length=1, max_length=1024)
+    manifest: dict | None = None  # when the folder has no hgs-game.json
+
+
+class ManifestBody(BaseModel):
+    manifest: dict
+
+
+class ProgramPath(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
 
 
 class StopGame(BaseModel):
@@ -136,8 +145,30 @@ def create_admin_app(core: "CoreApp") -> FastAPI:
 
     @app.post(f"{api}/games", dependencies=deps, status_code=201)
     async def add_game(body: AddGame) -> dict:
-        game = await core.servers.add_game(body.path)
+        game = await core.servers.add_game(body.path, body.manifest)
         return core.servers.game_view(game)
+
+    @app.get(f"{api}/games/{{game_id}}/manifest", dependencies=deps)
+    async def get_manifest(game_id: str) -> dict:
+        g = core.servers._get(game_id)
+        return {"manifest": g.manifest.model_dump(), "source": g.manifest_source}
+
+    @app.put(f"{api}/games/{{game_id}}/manifest", dependencies=deps)
+    async def put_manifest(game_id: str, body: ManifestBody) -> dict:
+        return core.servers.game_view(await core.servers.update_manifest(game_id, body.manifest))
+
+    # -- allowlist of programs ---------------------------------------------------------
+    @app.get(f"{api}/allowlist", dependencies=deps)
+    async def allowlist() -> list:
+        return core.settings.allowed_programs
+
+    @app.post(f"{api}/allowlist", dependencies=deps)
+    async def allow_program(body: ProgramPath) -> list:
+        return await core.allow_program(body.path)
+
+    @app.post(f"{api}/allowlist/remove", dependencies=deps)
+    async def disallow_program(body: ProgramPath) -> list:
+        return await core.disallow_program(body.path)
 
     @app.get(f"{api}/games/{{game_id}}", dependencies=deps)
     async def game(game_id: str) -> dict:

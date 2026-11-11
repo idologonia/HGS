@@ -34,6 +34,9 @@ class LaunchError(Exception):
     pass
 
 
+NOT_ALLOWED_PREFIX = "program is not in the allowlist: "
+
+
 def is_within(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root.resolve())
@@ -53,10 +56,25 @@ class LaunchSpec:
     memory_mb: int | None = None
 
 
+def is_within_nofollow(path: Path, root: Path) -> bool:
+    """Like is_within, but does not follow a symlink at `path` itself (venv interpreters on
+    Linux/macOS are symlinks to the base Python)."""
+    try:
+        Path(os.path.abspath(path)).relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
 class AllowList:
-    def __init__(self) -> None:
+    """Programs that may be started: HGS's own Python, programs inside a registered game
+    folder (the owner trusted that folder), and programs the owner approved explicitly."""
+
+    def __init__(self, approved: list[str] | None = None) -> None:
         self._programs: set[str] = set()
         self.add(sys.executable)
+        for p in approved or []:
+            self.add(p)
 
     @staticmethod
     def _norm(p: str) -> str:
@@ -69,8 +87,8 @@ class AllowList:
         return self._norm(program) in self._programs
 
     def validate(self, spec: LaunchSpec) -> None:
-        if not self.allows(spec.program):
-            raise LaunchError(f"program is not in the allowlist: {spec.program}")
+        if not (self.allows(spec.program) or is_within_nofollow(Path(spec.program), spec.game_root)):
+            raise LaunchError(f"{NOT_ALLOWED_PREFIX}{spec.program}")
         if not spec.game_root.is_dir():
             raise LaunchError(f"game folder does not exist: {spec.game_root}")
         if not is_within(spec.cwd, spec.game_root):

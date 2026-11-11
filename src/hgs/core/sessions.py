@@ -46,7 +46,8 @@ class Session:
         self.messages_out = 0
         self.closed = False  # permanently finished
         self.cleaned = False  # removed from rooms and the session list
-        self.generation = 0  # incremented on every resume (identifies the current connection)
+        self.generation = 0
+        self.proxied = False  # connected to a standalone game server (does not speak the HGS protocol)  # incremented on every resume (identifies the current connection)
         self.close_code: int | None = None
         self.detached_until: float | None = None
         self._resume_hash: bytes | None = None

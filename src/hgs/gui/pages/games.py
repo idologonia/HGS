@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from PySide6.QtCore import Qt, QUrl, Signal
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
     from hgs.gui.core_client import CoreClient
 
 ACTIVE = ("running", "starting", "stopping")
+NOT_ALLOWED = "program is not in the allowlist: "
 
 
 class GameCard(Card):
@@ -169,10 +171,41 @@ class GamesPage(QWidget):
 
     # -- actions --------------------------------------------------------------------
     def add_game(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Виберіть папку гри (з файлом hgs-game.json)")
+        path = QFileDialog.getExistingDirectory(self, "Виберіть папку гри")
         if not path:
             return
-        self.client.call("POST", "/games", {"path": path}, self._after("Не вдалося додати гру"))
+        body: dict = {"path": path}
+        if not (Path(path) / "hgs-game.json").is_file():
+            from hgs.gui.pages.add_game import AddGameDialog
+
+            dlg = AddGameDialog(self, path)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            body["manifest"] = dlg.manifest()
+        self.client.call("POST", "/games", body, self._after("Не вдалося додати гру"))
+
+    def _start(self, game_id: str) -> None:
+        def done(ok: bool, data) -> None:
+            if game_id in self.cards:
+                self.cards[game_id].set_busy(False)
+            if not ok:
+                self.banner.show_message(f"Помилка запуску: {data}")
+            elif data.get("state") == "error" and (data.get("last_error") or "").startswith(NOT_ALLOWED):
+                program = data["last_error"][len(NOT_ALLOWED):]
+                if QMessageBox.question(
+                    self, "Дозволити запуск програми",
+                    f"Гра «{data['name']}» хоче запустити програму поза своєю папкою:\n\n{program}\n\n"
+                    "Дозволяйте лише програми, яким довіряєте (наприклад, Python або Node.js). Дозвіл можна "
+                    "скасувати пізніше. Дозволити й запустити?") == QMessageBox.Yes:
+                    self.client.call("POST", "/allowlist", {"path": program},
+                                     lambda ok2, d2: self._start(game_id) if ok2 else
+                                     self.banner.show_message(f"Не вдалося дозволити програму: {d2}"))
+                    return
+            else:
+                self.banner.hide()
+            self.refresh()
+        self.cards[game_id].set_busy(True)
+        self.client.call("POST", f"/games/{game_id}/start", None, done)
 
     def _after(self, error_title: str, game_id: str | None = None) -> Callable[[bool, object], None]:
         def done(ok: bool, data) -> None:
@@ -191,8 +224,7 @@ class GamesPage(QWidget):
             return
         card = self.cards[game_id]
         if action == "start":
-            card.set_busy(True)
-            self.client.call("POST", f"/games/{game_id}/start", None, self._after("Помилка запуску", game_id))
+            self._start(game_id)
         elif action in ("stop", "restart"):
             grace = 5.0
             if g["players_online"] > 0:
@@ -256,21 +288,24 @@ class ConfirmStopDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    """Current configuration of the game (read from hgs-game.json) + reload / open folder."""
+    """Edit the game's configuration (validated by the core). Saving keeps the change inside HGS;
+    the game's own folder and its hgs-game.json are never modified."""
 
     def __init__(self, parent: QWidget, client: "CoreClient", g: dict, on_change: Callable[[], None]) -> None:
         super().__init__(parent)
         self.client, self.g, self.on_change = client, g, on_change
         self.setWindowTitle(f"Налаштування — {g['name']}")
-        self.resize(620, 520)
+        self.resize(680, 600)
         lay = QVBoxLayout(self)
-        info = QLabel("Конфігурація гри береться з файлу hgs-game.json у папці гри. Змініть файл і натисніть "
-                      "«Перечитати hgs-game.json» (сервер має бути зупинений). Редактор налаштувань у вікні — Етап 6.")
+        source = ("файл hgs-game.json у папці гри" if g.get("manifest_source") == "file"
+                  else "опис, збережений у HGS (папка гри не змінюється)")
+        info = QLabel(f"Джерело конфігурації: {source}. Зміни перевіряються перед збереженням; сервер має бути "
+                      "зупинений. Опис полів — docs/architecture/07-config-and-data.md.")
         info.setWordWrap(True)
         info.setObjectName("Muted")
         lay.addWidget(info)
         self.view = QPlainTextEdit()
-        self.view.setReadOnly(True)
+        self.view.setStyleSheet("font-family: Consolas, 'DejaVu Sans Mono', monospace;")
         lay.addWidget(self.view, 1)
         self.msg = QLabel()
         self.msg.setWordWrap(True)
@@ -281,48 +316,68 @@ class SettingsDialog(QDialog):
         self.pw_btn = QPushButton("Пароль гри…")
         self.pw_btn.setVisible(g["auth_mode"] == "password")
         self.pw_btn.clicked.connect(self._set_password)
+        stopped = g["state"] not in ACTIVE
+        self.save = QPushButton("Зберегти")
+        self.save.setObjectName("Primary")
+        self.save.clicked.connect(self._save)
         self.reload = QPushButton("Перечитати hgs-game.json")
-        self.reload.setEnabled(g["state"] not in ACTIVE)
-        self.reload.setToolTip("" if self.reload.isEnabled() else "Спочатку зупиніть сервер")
+        self.reload.setVisible(g.get("manifest_source") == "file")
         self.reload.clicked.connect(self._reload)
+        for b in (self.save, self.reload):
+            b.setEnabled(stopped)
+            b.setToolTip("" if stopped else "Спочатку зупиніть сервер")
         close = QPushButton("Закрити")
         close.clicked.connect(self.accept)
-        row.addWidget(folder)
-        row.addWidget(self.pw_btn)
-        row.addWidget(self.reload)
+        for b in (folder, self.pw_btn, self.reload):
+            row.addWidget(b)
         row.addStretch(1)
+        row.addWidget(self.save)
         row.addWidget(close)
         lay.addLayout(row)
         self._load()
 
     def _load(self) -> None:
-        path = f"{self.g['root_path']}/hgs-game.json"
+        def done(ok: bool, data) -> None:
+            if ok:
+                self.view.setPlainText(json.dumps(data["manifest"], indent=2, ensure_ascii=False))
+            else:
+                self.view.setPlainText(f"Не вдалося завантажити конфігурацію: {data}")
+        self.client.call("GET", f"/games/{self.g['id']}/manifest", None, done)
+
+    def _result(self, ok: bool, data, success: str) -> None:
+        self.msg.setText(success if ok else f"Помилка: {data}")
+        self.msg.setStyleSheet("" if ok else f"color: {RED};")
+        if ok:
+            self._load()
+            self.on_change()
+
+    def _save(self) -> None:
         try:
-            with open(path, encoding="utf-8") as f:
-                self.view.setPlainText(json.dumps(json.load(f), indent=2, ensure_ascii=False))
-        except Exception as exc:
-            self.view.setPlainText(f"Не вдалося прочитати {path}: {exc}")
+            manifest = json.loads(self.view.toPlainText())
+        except json.JSONDecodeError as exc:
+            self._result(False, f"некоректний JSON (рядок {exc.lineno}): {exc.msg}", "")
+            return
+        if self.g.get("manifest_source") == "file" and QMessageBox.question(
+                self, "Зберегти в HGS",
+                "Зміни буде збережено в HGS; файл hgs-game.json у папці гри не зміниться.\n"
+                "Кнопка «Перечитати hgs-game.json» стане недоступною, доки ви не додасте гру знову. Продовжити?"
+        ) != QMessageBox.Yes:
+            return
+        self.client.call("PUT", f"/games/{self.g['id']}/manifest", {"manifest": manifest},
+                         lambda ok, d: self._result(ok, d, "✓ Збережено"))
 
     def _set_password(self) -> None:
         from PySide6.QtWidgets import QInputDialog
 
         pw, ok = QInputDialog.getText(self, "Пароль гри", "Новий пароль для входу в гру (мінімум 6 символів).\n"
                                       "Він зберігається лише як хеш; повідомте його друзям самі:", QLineEdit.Password)
-        if not ok or not pw:
-            return
-
-        def done(ok: bool, data) -> None:
-            self.msg.setText("✓ Пароль гри встановлено" if ok else f"Помилка: {data}")
-            self.msg.setStyleSheet("" if ok else f"color: {RED};")
-        self.client.call("POST", f"/games/{self.g['id']}/password", {"password": pw}, done)
+        if ok and pw:
+            self.client.call("POST", f"/games/{self.g['id']}/password", {"password": pw},
+                             lambda ok2, d: self._result(ok2, d, "✓ Пароль гри встановлено"))
 
     def _reload(self) -> None:
-        def done(ok: bool, data) -> None:
-            self.msg.setText("✓ Конфігурацію оновлено" if ok else f"Помилка: {data}")
-            self.msg.setStyleSheet("" if ok else f"color: {RED};")
-            self._load()
-            self.on_change()
-        self.client.call("POST", f"/games/{self.g['id']}/reload", None, done)
+        self.client.call("POST", f"/games/{self.g['id']}/reload", None,
+                         lambda ok, d: self._result(ok, d, "✓ Конфігурацію перечитано з hgs-game.json"))
 
 
 class StatusDialog(QDialog):
@@ -339,6 +394,7 @@ class StatusDialog(QDialog):
             ("Працює", fmt_duration(g["uptime_s"])), ("Автоперезапусків", str(g["restarts"])),
             ("Остання помилка", g["last_error"] or "—"), ("Папка гри", g["root_path"]),
             ("Адреса клієнта", g["client_url"] or "—"),
+            ("Шлях проксі", g.get("proxy_path") or "—"),
             ("Метрики адаптера", json.dumps(g["metrics"], ensure_ascii=False) if g["metrics"] else "—"),
         ]
         for k, v in rows:

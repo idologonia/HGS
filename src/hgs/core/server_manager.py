@@ -100,10 +100,15 @@ class GameContext:
         room = self._m.rooms.get(self.game_id, room_id)
         if room is None:
             return False
+        text = msg("event", {"e": event, "d": data, "from": sender or "server"})
         s = room.players.get(player_id)
         if s is None:
+            queue = room.pending.get(player_id)
+            if queue is not None and len(queue) < 100:
+                queue.append(text)  # the player is joining right now
+                return True
             return False
-        s.send(msg("event", {"e": event, "d": data, "from": sender or "server"}))
+        s.send(text)
         return True
 
     def room_players(self, room_id: str) -> list[PlayerRef]:
@@ -127,6 +132,7 @@ class GameServer:
     restarts: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     restart_task: asyncio.Task | None = None
+    manifest_source: str = "file"  # "file" = hgs-game.json in the game folder, "hgs" = kept inside HGS
 
     @property
     def game_id(self) -> str:
@@ -184,11 +190,13 @@ class ServerManager:
         for row in await self.db.fetchall("SELECT game_id, root_path FROM games ORDER BY name"):
             gp = self.data.game(row["game_id"])
             try:
-                manifest = parse_manifest(json.loads(gp.config.read_text(encoding="utf-8"))["manifest"])
+                stored = json.loads(gp.config.read_text(encoding="utf-8"))
+                manifest = parse_manifest(stored["manifest"])
             except Exception as exc:  # a broken game must not prevent HGS from starting
                 log.error("cannot load game %s: %s", row["game_id"], exc)
                 continue
-            self.games[manifest.id] = GameServer(manifest, Path(row["root_path"]), gp)
+            self.games[manifest.id] = GameServer(manifest, Path(row["root_path"]), gp,
+                                                 manifest_source=stored.get("manifest_source", "file"))
 
     def _validate(self, manifest: GameManifest) -> None:
         cls = self.registry.get(manifest.adapter)
@@ -200,13 +208,18 @@ class ServerManager:
         if not result.ok:
             raise GameError("bad_request", "; ".join(result.errors))
 
-    async def add_game(self, directory: str) -> GameServer:
+    async def add_game(self, directory: str, manifest_data: dict | None = None) -> GameServer:
+        """Register a game folder. Without manifest_data, hgs-game.json is read from the folder;
+        with it, the description is kept only inside HGS (the game folder is not modified)."""
         root = Path(directory).expanduser()
         if not root.is_dir():
             raise GameError("bad_request", f"directory does not exist: {directory}")
         root = root.resolve()
         try:
-            manifest = load_manifest_file(root / MANIFEST_FILE)
+            if manifest_data is not None:
+                manifest = parse_manifest(manifest_data)
+            else:
+                manifest = load_manifest_file(root / MANIFEST_FILE)
         except ManifestError as exc:
             raise GameError("bad_request", str(exc))
         if manifest.id in self.games:
@@ -214,12 +227,13 @@ class ServerManager:
         self._validate(manifest)
         gp = self.data.game(manifest.id)
         gp.ensure()
-        atomic_write_json(gp.config, {"root_path": str(root), "manifest": manifest.model_dump()})
+        source = "hgs" if manifest_data is not None else "file"
+        atomic_write_json(gp.config, {"root_path": str(root), "manifest_source": source, "manifest": manifest.model_dump()})
         await self.db.execute(
             "INSERT INTO games(game_id, name, adapter, root_path, added_at) VALUES (?,?,?,?,?)",
             (manifest.id, manifest.name, manifest.adapter, str(root), utcnow()),
         )
-        game = GameServer(manifest, root, gp)
+        game = GameServer(manifest, root, gp, manifest_source=source)
         self.games[manifest.id] = game
         log.info("game added: %s (%s) from %s", manifest.id, manifest.adapter, root)
         self.bus.publish("game.added", game=self.game_view(game))
@@ -230,6 +244,9 @@ class ServerManager:
         async with game.lock:
             if game.state not in (AdapterState.STOPPED, AdapterState.ERROR, AdapterState.FAILED):
                 raise GameError("conflict", "stop the server before reloading its configuration")
+            if not (game.root / MANIFEST_FILE).is_file():
+                raise GameError("bad_request", f"{MANIFEST_FILE} not found in the game folder; this game's description "
+                                               "is kept in HGS — edit it in Settings")
             try:
                 manifest = load_manifest_file(game.root / MANIFEST_FILE)
             except ManifestError as exc:
@@ -237,9 +254,32 @@ class ServerManager:
             if manifest.id != game_id:
                 raise GameError("bad_request", f"manifest id changed to {manifest.id!r}; remove and add the game again")
             self._validate(manifest)
-            atomic_write_json(game.paths.config, {"root_path": str(game.root), "manifest": manifest.model_dump()})
+            atomic_write_json(game.paths.config, {"root_path": str(game.root), "manifest_source": "file",
+                                                  "manifest": manifest.model_dump()})
             await self.db.execute("UPDATE games SET name=?, adapter=? WHERE game_id=?", (manifest.name, manifest.adapter, game_id))
             game.manifest = manifest
+            game.manifest_source = "file"
+        self.bus.publish("game.updated", game=self.game_view(game))
+        return game
+
+    async def update_manifest(self, game_id: str, data: dict) -> GameServer:
+        """Change the game's configuration inside HGS (Settings editor). The game folder is not modified."""
+        game = self._get(game_id)
+        async with game.lock:
+            if game.state not in (AdapterState.STOPPED, AdapterState.ERROR, AdapterState.FAILED):
+                raise GameError("conflict", "stop the server before changing its configuration")
+            try:
+                manifest = parse_manifest(data)
+            except ManifestError as exc:
+                raise GameError("bad_request", str(exc))
+            if manifest.id != game_id:
+                raise GameError("bad_request", "the game id cannot be changed")
+            self._validate(manifest)
+            atomic_write_json(game.paths.config, {"root_path": str(game.root), "manifest_source": "hgs",
+                                                  "manifest": manifest.model_dump()})
+            await self.db.execute("UPDATE games SET name=?, adapter=? WHERE game_id=?", (manifest.name, manifest.adapter, game_id))
+            game.manifest = manifest
+            game.manifest_source = "hgs"
         self.bus.publish("game.updated", game=self.game_view(game))
         return game
 
@@ -440,6 +480,9 @@ class ServerManager:
             "restarts": game.restarts,
             "auth_mode": m.auth.mode,
             "client_url": m.client.url,
+            "manifest_source": game.manifest_source,
+            "proxy_path": f"/hgs/v1/proxy/{m.id}/" if m.adapter in ("python", "process")
+            and (m.backend or {}).get("mode") == "standalone" else None,
             "metrics": metrics,
         }
 

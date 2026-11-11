@@ -28,7 +28,11 @@ class AdapterRegistry:
 
 def builtin_registry() -> AdapterRegistry:
     from .html.adapter import HtmlAdapter
+    from .process.adapter import ProcessAdapter
+    from .python.adapter import PythonAdapter
 
     reg = AdapterRegistry()
     reg.register(HtmlAdapter)
+    reg.register(PythonAdapter)
+    reg.register(ProcessAdapter)
     return reg

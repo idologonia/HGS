@@ -1,0 +1,9 @@
+{
+  "id": "py-counter",
+  "name": "Python Counter (worker)",
+  "version": "1.0.0",
+  "adapter": "python",
+  "backend": { "mode": "worker", "entry": "server/logic.py:Game", "python": "auto", "config": { "goal": 100 } },
+  "auth": { "mode": "open" },
+  "saves": { "enabled": true, "interval_s": 60 }
+}

@@ -1,0 +1,8 @@
+{
+  "id": "node-chat",
+  "name": "Node.js Chat (worker)",
+  "version": "1.0.0",
+  "adapter": "process",
+  "backend": { "mode": "worker", "command": "node", "args": ["worker.js"] },
+  "auth": { "mode": "open" }
+}

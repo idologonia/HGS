@@ -213,3 +213,48 @@ def test_network_page_switches_mode(qapp, window):
     wait_until(qapp, lambda: w.network.banner.isVisible(), what="error for direct mode without TLS")
     assert "certificate" in w.network.banner.label.text()
     assert w.network.view["settings"]["mode"] == "lan"  # unchanged after the refused change
+
+
+def test_add_python_project_without_manifest_and_edit_settings(qapp, window, tmp_path):
+    import shutil
+    from pathlib import Path
+
+    from hgs.gui.pages.add_game import AddGameDialog
+    from hgs.gui.pages.games import SettingsDialog
+
+    w = window
+    folder = tmp_path / "My Chat"
+    shutil.copytree(Path(__file__).resolve().parents[2] / "examples" / "python-standalone" / "server", folder / "server")
+    dlg = AddGameDialog(w, str(folder))
+    assert dlg.gid.text() == "my-chat" and dlg.entry.text() == "server/main.py"
+    dlg.kind.setCurrentIndex(dlg.kind.findData("python-standalone"))
+    dlg.auth.setCurrentIndex(dlg.auth.findData("open"))
+    manifest = dlg.manifest()
+    assert manifest["backend"] == {"mode": "standalone", "entry": "server/main.py", "python": "auto",
+                                   "args": ["--port", "{port}"], "port": "auto"}
+    w.client.call("POST", "/games", {"path": str(folder), "manifest": manifest})
+    wait_until(qapp, lambda: "my-chat" in w.games.cards, what="card")
+    card = w.games.cards["my-chat"]
+    card.buttons["start"].click()
+    wait_until(qapp, lambda: card.game["state"] == "running", what="standalone running")
+    assert not (folder / "hgs-game.json").exists()
+    assert "PID" in card.stats.text()
+
+    from websockets.sync.client import connect
+
+    with connect(f"ws://127.0.0.1:{w.launcher.gateway_port}{card.game['proxy_path']}") as ws:
+        ws.send("hi from the GUI test")
+        assert json.loads(ws.recv(timeout=5)) == {"chat": "hi from the GUI test"}
+
+    card.buttons["stop"].click()
+    wait_until(qapp, lambda: card.game["state"] == "stopped", what="stopped")
+    sd = SettingsDialog(w, w.client, card.game, w.games.refresh)
+    wait_until(qapp, lambda: '"my-chat"' in sd.view.toPlainText(), what="manifest loaded")
+    sd.view.setPlainText(sd.view.toPlainText().replace('"name": "My Chat"', '"name": "Renamed Chat"'))
+    sd.save.click()
+    wait_until(qapp, lambda: sd.msg.text().startswith("✓"), what="saved")
+    wait_until(qapp, lambda: card.game["name"] == "Renamed Chat", what="card renamed")
+    sd.view.setPlainText("{ not json")
+    sd.save.click()
+    assert "некоректний JSON" in sd.msg.text()
+    sd.close()
