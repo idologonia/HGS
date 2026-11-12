@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hgs"
-version = "0.1.4"
+version = "0.1.5"
 description = "HOME GAME SERVER - home game server platform for Windows"
 requires-python = ">=3.12"
 readme = "README.md"

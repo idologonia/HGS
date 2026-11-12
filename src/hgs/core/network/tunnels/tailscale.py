@@ -39,7 +39,8 @@ class TailscaleFunnel(CloudflareTunnel):
         self.dns_name: str | None = None
 
     def _args(self) -> list[str]:
-        return ["funnel", str(self.local_port)]
+        # an explicit IPv4 target: "localhost" may resolve to ::1 on Windows, where HGS does not listen
+        return ["funnel", f"http://127.0.0.1:{self.local_port}"]
 
     async def _status(self) -> dict:
         proc = await asyncio.create_subprocess_exec(*self.command, "status", "--json", stdin=asyncio.subprocess.DEVNULL,

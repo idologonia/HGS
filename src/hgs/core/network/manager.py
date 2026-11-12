@@ -185,6 +185,9 @@ class NetworkManager:
                   or new.mode == "direct" or old_settings.network.mode == "direct")
         if new.mode != "tunnel" or new.tunnel != old_settings.network.tunnel:
             await self.stop_tunnel()
+        tunnel_was_running = self.tunnel is not None and self.tunnel.state in ("starting", "connected", "reconnecting")
+        if rebind and tunnel_was_running:
+            await self.stop_tunnel()  # it points at the old port
         self.core.settings = updated
         try:
             if rebind:
@@ -197,6 +200,11 @@ class NetworkManager:
             atomic_write_json(self.core.paths.settings, updated.model_dump(exclude_none=True))
         self._restart_duckdns()
         self._published_url = "unset"  # republish with the new settings
+        if rebind and tunnel_was_running and new.mode == "tunnel":
+            try:
+                await self.start_tunnel()  # follow the gateway to its new port
+            except NetworkError as exc:
+                log.warning("tunnel was not restarted: %s", exc)
         log.info("network mode: %s (gateway %s:%d)", new.mode, updated.bind_host(), self.core.gateway_port)
         self._changed()
 

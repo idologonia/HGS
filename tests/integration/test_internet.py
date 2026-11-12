@@ -316,7 +316,7 @@ if sys.argv[1] == "funnel":
     print("Available on the internet:", flush=True)
     print("", flush=True)
     print("https://my-pc.tail1234.ts.net/", flush=True)
-    print("|-- proxy http://127.0.0.1:" + sys.argv[2], flush=True)
+    print("|-- proxy " + sys.argv[2], flush=True)
     time.sleep(60)
 '''
 
@@ -378,3 +378,25 @@ async def test_tailscale_not_installed(hgs, monkeypatch):
     await net(hgs, mode="tunnel", tunnel={"provider": "tailscale_funnel"})
     r = await hgs.admin.post("/network/tunnel/start")
     assert r.status_code == 400 and "tailscale.com/download" in r.json()["message"]
+
+
+
+async def test_tunnel_follows_gateway_port_change(hgs, fake_tailscale):
+    await net(hgs, mode="tunnel", tunnel={"provider": "tailscale_funnel"})
+    await hgs.admin.post("/network/tunnel/start")
+    await _tunnel_view(hgs, "connected")
+    current = (await hgs.admin.get("/network")).json()["settings"]
+    import socket
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        new_port = sk.getsockname()[1]
+    r = await hgs.admin.put("/network", json={"network": current, "gateway_port": new_port})
+    assert r.status_code == 200, r.text
+    for _ in range(200):
+        view = (await hgs.admin.get("/network")).json()
+        if view["tunnel"]["state"] == "connected" and any(f"http://127.0.0.1:{new_port}" in x for x in view["tunnel"]["log_tail"]):
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError(view["tunnel"])
+    assert hgs.core.gateway_port == new_port
