@@ -94,7 +94,8 @@ class MainWindow(QMainWindow):
         rl = QVBoxLayout(right)
         rl.setContentsMargins(16, 12, 16, 0)
         self.banner = Banner()
-        self.banner.action.clicked.connect(self.restart_core)
+        self.banner.action.clicked.connect(self._banner_action)
+        self._stale_core = False
         rl.addWidget(self.banner)
         self.info_banner = Banner("info")
         rl.addWidget(self.info_banner)
@@ -151,6 +152,14 @@ class MainWindow(QMainWindow):
         self.launcher.start()
 
     # -- core lifecycle -------------------------------------------------------------
+    def _banner_action(self) -> None:
+        if self._stale_core:
+            from hgs.common.platform import stop_stale_core
+
+            stop_stale_core(self.data_dir)
+            self._stale_core = False
+        self.restart_core()
+
     def restart_core(self) -> None:
         self.banner.hide()
         self.core_label.setText("● Ядро: запуск…")
@@ -176,7 +185,12 @@ class MainWindow(QMainWindow):
         details = self.launcher.last_stderr()
         text = message + (f"\n\nОстанні рядки:\n{details[-800:]}" if details and details not in message else "")
         text += f"\n\nЛог ядра: {self.data_dir / 'logs' / 'core.log'}"
-        self.banner.show_message(text, "Перезапустити ядро", closable=False)
+        self._stale_core = "Another HGS instance" in message
+        if self._stale_core:
+            text = ("Попередня копія серверного ядра HGS ще працює у фоні (наприклад, після оновлення або якщо HGS "
+                    "відкрили двічі). Її можна завершити — ігрові сервери в ній буде зупинено.")
+        self.banner.show_message(text, "Завершити старе ядро і запустити знову" if self._stale_core
+                                 else "Перезапустити ядро", closable=False)
         self.status_text.setText("Серверне ядро не працює")
 
     def _on_core_stopped(self) -> None:

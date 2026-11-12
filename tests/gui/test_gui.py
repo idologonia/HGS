@@ -367,3 +367,37 @@ def test_network_form_keeps_unsaved_input_and_saves_publish_settings(qapp, windo
     assert n.view["settings"]["publish"]["enabled"] is True and not n.dirty
     n.refresh()
     wait_until(qapp, lambda: n.pub_repo.text() == "idologonia/hgs-address", what="value survives refresh")
+
+
+def test_leftover_core_can_be_stopped_from_the_banner(qapp, tmp_path, monkeypatch):
+    import secrets
+    import subprocess
+    import sys
+
+    from hgs.gui.main_window import MainWindow
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "settings.json").write_text(json.dumps({"admin": {"port": 0}, "gateway": {"port": 0},
+                                                    "worker_bus": {"port": 0}}))
+    old = subprocess.Popen([sys.executable, "-m", "hgs", "--core", "--token-stdin", "--data-dir", str(data)],
+                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    old.stdin.write(secrets.token_urlsafe(32) + "\n")
+    old.stdin.flush()
+    assert json.loads(old.stdout.readline())["event"] == "ready"
+    try:
+        monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+        w = MainWindow(data)
+        w.show()
+        wait_until(qapp, lambda: w.banner.isVisible(), what="banner about the old core")
+        assert "ще працює у фоні" in w.banner.label.text()
+        assert w.banner.action.text().startswith("Завершити старе ядро")
+        w.banner.action.click()
+        wait_until(qapp, lambda: w._core_ready, timeout=30, what="new core started")
+        assert old.wait(10) is not None  # the leftover core was stopped
+        w._force_quit = True
+        w.close()
+        wait_until(qapp, lambda: not w.launcher.is_running(), timeout=20, what="core stop")
+    finally:
+        if old.poll() is None:
+            old.kill()
