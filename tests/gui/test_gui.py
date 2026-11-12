@@ -401,3 +401,14 @@ def test_leftover_core_can_be_stopped_from_the_banner(qapp, tmp_path, monkeypatc
     finally:
         if old.poll() is None:
             old.kill()
+
+
+def test_network_page_tailscale_option(qapp, window):
+    w = window
+    n = w.network
+    w.nav.setCurrentRow(w.stack.indexOf(n))
+    wait_until(qapp, lambda: n.view is not None, what="network view")
+    n.provider.setCurrentIndex(n.provider.findData("tailscale_funnel"))
+    n._provider_changed()
+    assert n.install_ts.isVisibleTo(n) and not n.download_btn.isVisibleTo(n)
+    assert n.prog_label.text() == "tailscale:"

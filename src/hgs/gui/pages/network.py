@@ -5,8 +5,8 @@ from __future__ import annotations
 import copy
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QMessageBox, QPushButton, QRadioButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
@@ -109,7 +109,9 @@ class NetworkPage(QWidget):
         tform = QFormLayout()
         self.provider = QComboBox()
         self.provider.addItem("Швидкий тунель (без акаунта, адреса змінюється)", "cloudflare_quick")
-        self.provider.addItem("Постійний тунель (акаунт Cloudflare + свій домен)", "cloudflare_named")
+        self.provider.addItem("Tailscale Funnel (безкоштовно, постійна адреса, рідко блокується) — рекомендовано",
+                              "tailscale_funnel")
+        self.provider.addItem("Постійний тунель Cloudflare (акаунт + свій домен)", "cloudflare_named")
         self.provider.currentIndexChanged.connect(self._provider_changed)
         tform.addRow("Тип:", self.provider)
         self.named_url = QLineEdit()
@@ -125,7 +127,12 @@ class NetworkPage(QWidget):
         browse.clicked.connect(self._browse_cloudflared)
         self.download_btn = QPushButton("Завантажити cloudflared")
         self.download_btn.clicked.connect(self._download)
-        tform.addRow("cloudflared:", self._hbox(self.cf_path, browse, self.download_btn))
+        self.install_ts = QPushButton("Встановити Tailscale…")
+        self.install_ts.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://tailscale.com/download/windows")))
+        self.ts_path = QLineEdit()
+        self.ts_path.setPlaceholderText("знайти автоматично")
+        self.prog_label = QLabel("cloudflared:")
+        tform.addRow(self.prog_label, self._hbox(self.cf_path, self.ts_path, browse, self.download_btn, self.install_ts))
         self.cf_found = QLabel()
         self.cf_found.setObjectName("Muted")
         self.cf_found.setWordWrap(True)
@@ -141,6 +148,8 @@ class NetworkPage(QWidget):
         tl.addLayout(_row(self.tunnel_state, self.tunnel_start, self.tunnel_stop))
         self.tunnel_error = QLabel()
         self.tunnel_error.setWordWrap(True)
+        self.tunnel_error.setOpenExternalLinks(True)
+        self.tunnel_error.setTextInteractionFlags(Qt.TextBrowserInteraction)
         self.tunnel_error.setStyleSheet(f"color: {RED};")
         tl.addWidget(self.tunnel_error)
         self.limits = QLabel()
@@ -213,7 +222,7 @@ class NetworkPage(QWidget):
         lay.addWidget(db)
 
         # mark the form as edited, so periodic refreshes do not overwrite what the user typed
-        for edit in (self.named_url, self.cf_path, self.public_host, self.cert, self.key, self.duck_domain,
+        for edit in (self.named_url, self.cf_path, self.ts_path, self.public_host, self.cert, self.key, self.duck_domain,
                      self.pub_repo, self.pub_path):
             edit.textEdited.connect(self._mark_dirty)
         for w in (self.port, self.public_port):
@@ -291,6 +300,7 @@ class NetworkPage(QWidget):
         self.provider.setCurrentIndex(idx)
         self.provider.blockSignals(False)
         for edit, value in ((self.named_url, t.get("named_public_url")), (self.cf_path, t.get("cloudflared_path")),
+                            (self.ts_path, t.get("tailscale_path")),
                             (self.public_host, s["direct"].get("public_host")), (self.cert, s["direct"].get("tls_cert")),
                             (self.key, s["direct"].get("tls_key")), (self.duck_domain, s["direct"].get("duckdns_domain"))):
             if not edit.hasFocus():
@@ -308,12 +318,23 @@ class NetworkPage(QWidget):
         text, color = TUNNEL_STATES.get(tun["state"], (tun["state"], MUTED))
         self.tunnel_state.setText(f"● {text}" + (f" — {tun['url']}" if tun.get("url") else ""))
         self.tunnel_state.setStyleSheet(f"color: {color}; font-weight: 600;")
-        self.tunnel_error.setText(tun.get("error") or "")
+        err = tun.get("error") or ""
+        import html as _html
+        import re as _re
+
+        err_html = _re.sub(r"(https://\S+)", r'<a href="\1" style="color:#4f8cff">\1</a>', _html.escape(err))
+        self.tunnel_error.setText(err_html)
+        # a link to allow Funnel is an instruction, not an error
+        self.tunnel_error.setStyleSheet(f"color: {YELLOW if tun['state'] == 'starting' else RED};")
         self.tunnel_error.setVisible(bool(tun.get("error")))
         self.limits.setText("\n".join("• " + x for x in tun["limitations"]))
         found = tun.get("binary")
-        self.cf_found.setText(f"Знайдено: {found}" if found else "cloudflared не знайдено. Завантажте його кнопкою або "
-                              "вкажіть шлях до cloudflared.exe.")
+        if s["tunnel"]["provider"] == "tailscale_funnel":
+            self.cf_found.setText(f"Знайдено: {found}" if found else "Tailscale не знайдено: натисніть «Встановити "
+                                  "Tailscale…», встановіть програму, увійдіть в акаунт і поверніться сюди.")
+        else:
+            self.cf_found.setText(f"Знайдено: {found}" if found else "cloudflared не знайдено. Завантажте його кнопкою або "
+                                  "вкажіть шлях до cloudflared.exe.")
         running = tun["state"] in ("starting", "connected", "reconnecting")
         in_tunnel = s["mode"] == "tunnel"
         self.tunnel_start.setEnabled(in_tunnel and not running and bool(found))
@@ -340,9 +361,16 @@ class NetworkPage(QWidget):
             self._show_check(data["last_check"])
 
     def _provider_changed(self) -> None:
-        named = self.provider.currentData() == "cloudflare_named"
+        provider = self.provider.currentData()
+        named = provider == "cloudflare_named"
+        ts = provider == "tailscale_funnel"
         self.named_url.setEnabled(named)
         self.token_btn.setEnabled(named)
+        self.prog_label.setText("tailscale:" if ts else "cloudflared:")
+        self.cf_path.setVisible(not ts)
+        self.download_btn.setVisible(not ts)
+        self.ts_path.setVisible(ts)
+        self.install_ts.setVisible(ts)
 
     # -- actions ------------------------------------------------------------------
     def _call(self, method: str, path: str, body: Any, title: str) -> None:
@@ -359,7 +387,8 @@ class NetworkPage(QWidget):
         s = copy.deepcopy(self.view["settings"])
         s["mode"] = next(k for k, b in self.mode_buttons.items() if b.isChecked())
         s["tunnel"].update(provider=self.provider.currentData(), named_public_url=self.named_url.text().strip() or None,
-                           cloudflared_path=self.cf_path.text().strip() or None)
+                           cloudflared_path=self.cf_path.text().strip() or None,
+                           tailscale_path=self.ts_path.text().strip() or None)
         s["direct"].update(public_host=self.public_host.text().strip() or None,
                            public_port=self.public_port.value() or None,
                            tls_cert=self.cert.text().strip() or None, tls_key=self.key.text().strip() or None,
@@ -420,9 +449,12 @@ class NetworkPage(QWidget):
             self._call("PUT", f"/secrets/{name}", {"value": value.strip()}, title)
 
     def _browse_cloudflared(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Виберіть cloudflared", "", "cloudflared (cloudflared*);;Усі файли (*)")
+        ts = self.provider.currentData() == "tailscale_funnel"
+        name = "tailscale" if ts else "cloudflared"
+        path, _ = QFileDialog.getOpenFileName(self, f"Виберіть {name}", "", f"{name} ({name}*);;Усі файли (*)")
         if path:
-            self.cf_path.setText(path)
+            (self.ts_path if ts else self.cf_path).setText(path)
+            self._mark_dirty()
 
     def _browse_file(self, edit: QLineEdit) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Виберіть файл", "", "PEM (*.pem *.crt *.key);;Усі файли (*)")

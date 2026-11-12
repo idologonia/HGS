@@ -39,6 +39,13 @@ LIMITATIONS = {
         "Призначено для тестів і розробки: Cloudflare не гарантує доступність і може змінити умови.",
         "Є обмеження на кількість одночасних запитів; для невеликої компанії друзів цього зазвичай достатньо.",
     ],
+    "tailscale_funnel": [
+        "Безкоштовно. Постійна адреса https://<назва-пк>.<ваша-мережа>.ts.net — не змінюється між запусками.",
+        "Домен ts.net рідко блокують антивіруси й провайдери (на відміну від trycloudflare.com).",
+        "Потрібно один раз встановити Tailscale (tailscale.com/download) і увійти в акаунт; Funnel вмикається "
+        "одним натисканням у панелі Tailscale (HGS покаже посилання).",
+        "Tailscale обмежує пропускну здатність Funnel; для ігор з друзями зазвичай вистачає. Доступність не гарантована.",
+    ],
     "cloudflare_named": [
         "Постійна адреса на вашому домені (наприклад, https://play.example.com).",
         "Потрібні безкоштовний акаунт Cloudflare і власний домен, підключений до Cloudflare (домен зазвичай платний).",
@@ -82,6 +89,9 @@ class CloudflareTunnel:
     def limitations(self) -> list[str]:
         return LIMITATIONS[self.kind]
 
+    async def _precheck(self) -> bool:
+        return True
+
     def _set(self, state: str, error: str | None = None) -> None:
         self.state = state
         self.error = error
@@ -94,6 +104,8 @@ class CloudflareTunnel:
 
     async def start(self) -> None:
         if self._task and not self._task.done():
+            return
+        if not await self._precheck():
             return
         if self.kind == "cloudflare_named" and (not self.token or not self.named_url):
             self._set("failed", "для постійного тунелю потрібні токен тунелю і публічна адреса")
@@ -152,16 +164,20 @@ class CloudflareTunnel:
                 continue
             self.lines.append(text[:500])
             log.info("[cloudflared] %s", text[:500])
-            if self.kind == "cloudflare_quick" and self.public_url is None:
-                m = QUICK_URL_RE.search(text)
-                if m:
-                    self.public_url = m.group(0)
-                    self._set("connected")
-            elif self.kind == "cloudflare_named" and self.state != "connected" and CONNECTED_RE.search(text):
-                self._set("connected")
+            self._on_line(text)
         code = await self._proc.wait()
         self._container.close()
         return code
+
+    def _on_line(self, text: str) -> None:
+        """React to one line of the tunnel program's output."""
+        if self.kind == "cloudflare_quick" and self.public_url is None:
+            m = QUICK_URL_RE.search(text)
+            if m:
+                self.public_url = m.group(0)
+                self._set("connected")
+        elif self.kind == "cloudflare_named" and self.state != "connected" and CONNECTED_RE.search(text):
+            self._set("connected")
 
     async def stop(self) -> None:
         self._stopping = True

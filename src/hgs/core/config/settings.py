@@ -37,8 +37,10 @@ class WorkerBusSettings(_Strict):
 class TunnelSettings(_Strict):
     # cloudflare_quick: free, no account, random https://*.trycloudflare.com address that changes on every start
     # cloudflare_named: free Cloudflare account + your own domain; fixed address; token stored encrypted
-    provider: Literal["cloudflare_quick", "cloudflare_named"] = "cloudflare_quick"
+    # tailscale_funnel: free Tailscale account; fixed https://<pc>.<tailnet>.ts.net address, rarely blocked
+    provider: Literal["cloudflare_quick", "cloudflare_named", "tailscale_funnel"] = "cloudflare_quick"
     cloudflared_path: str | None = None
+    tailscale_path: str | None = None
     named_public_url: str | None = Field(None, max_length=200)  # e.g. https://play.example.com
 
 

@@ -131,7 +131,7 @@ class Gateway:
         # address is in CF-Connecting-IP. The header is trusted ONLY in tunnel mode and only from
         # a local peer — anyone else could forge it.
         if self.core.settings.network.mode == "tunnel" and peer in ("127.0.0.1", "::1"):
-            cf = ws.headers.get("cf-connecting-ip", "")
+            cf = ws.headers.get("cf-connecting-ip", "") or ws.headers.get("x-forwarded-for", "").split(",")[0]
             try:
                 return str(ipaddress.ip_address(cf.strip()))
             except ValueError:

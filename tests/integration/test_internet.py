@@ -297,3 +297,84 @@ async def test_ban_revokes_tokens_and_kicks(hgs):
     known = (await hgs.admin.get("/players/known", params={"game_id": "mod"})).json()
     assert known[0]["banned"] == 1 and known[0]["ban_reason"] == "cheating"
     assert (await hgs.admin.post(f"/players/mod/{pid}/unban")).status_code == 200
+
+
+# ---------------------------------------------------------------- Tailscale Funnel (fake CLI)
+FAKE_TAILSCALE = '''
+import json, os, sys, time
+mode = os.environ.get("FAKE_TS", "ok")
+if sys.argv[1:3] == ["status", "--json"]:
+    state = "NeedsLogin" if mode == "logged_out" else "Running"
+    print(json.dumps({"BackendState": state, "Self": {"DNSName": "my-pc.tail1234.ts.net."}}))
+    sys.exit(0)
+if sys.argv[1] == "funnel":
+    if mode == "needs_enable":
+        print("Funnel is not enabled on your tailnet.", flush=True)
+        print("To enable, visit:", flush=True)
+        print("         https://login.tailscale.com/f/funnel?node=nABC123", flush=True)
+        time.sleep(60)
+    print("Available on the internet:", flush=True)
+    print("", flush=True)
+    print("https://my-pc.tail1234.ts.net/", flush=True)
+    print("|-- proxy http://127.0.0.1:" + sys.argv[2], flush=True)
+    time.sleep(60)
+'''
+
+
+@pytest.fixture
+def fake_tailscale(tmp_path, monkeypatch):
+    from hgs.core.network import manager
+
+    script = tmp_path / "fake_tailscale.py"
+    script.write_text(FAKE_TAILSCALE)
+    monkeypatch.setattr(manager.NetworkManager, "tunnel_command", lambda self: [sys.executable, str(script)])
+    return script
+
+
+async def _tunnel_view(hgs, state: str) -> dict:
+    for _ in range(200):
+        view = (await hgs.admin.get("/network")).json()
+        if view["tunnel"]["state"] == state:
+            return view
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"tunnel state is {view['tunnel']}")
+
+
+async def test_tailscale_funnel_gives_fixed_address(hgs, fake_tailscale):
+    await net(hgs, mode="tunnel", tunnel={"provider": "tailscale_funnel"})
+    r = await hgs.admin.post("/network/tunnel/start")
+    assert r.status_code == 200, r.text
+    view = await _tunnel_view(hgs, "connected")
+    assert view["tunnel"]["url"] == "https://my-pc.tail1234.ts.net"
+    assert view["player_url"] == "wss://my-pc.tail1234.ts.net"
+    assert any("ts.net" in x for x in view["tunnel"]["limitations"])
+    assert any(f"127.0.0.1:{hgs.core.gateway_port}" in x for x in view["tunnel"]["log_tail"])
+    await hgs.admin.post("/network/tunnel/stop")
+    await _tunnel_view(hgs, "stopped")
+
+
+async def test_tailscale_logged_out_and_funnel_not_enabled(hgs, fake_tailscale, monkeypatch):
+    await net(hgs, mode="tunnel", tunnel={"provider": "tailscale_funnel"})
+    monkeypatch.setenv("FAKE_TS", "logged_out")
+    await hgs.admin.post("/network/tunnel/start")
+    view = await _tunnel_view(hgs, "failed")
+    assert "увійдіть" in view["tunnel"]["error"]
+    monkeypatch.setenv("FAKE_TS", "needs_enable")
+    await hgs.admin.post("/network/tunnel/start")
+    for _ in range(200):
+        view = (await hgs.admin.get("/network")).json()
+        if view["tunnel"]["error"] and "login.tailscale.com/f/funnel" in view["tunnel"]["error"]:
+            break
+        await asyncio.sleep(0.05)
+    assert view["tunnel"]["state"] == "starting"  # waits for the user to allow Funnel
+    assert "https://login.tailscale.com/f/funnel?node=nABC123" in view["tunnel"]["error"]
+    await hgs.admin.post("/network/tunnel/stop")
+
+
+async def test_tailscale_not_installed(hgs, monkeypatch):
+    from hgs.core.network import manager
+
+    monkeypatch.setattr(manager, "find_tailscale", lambda configured: None)
+    await net(hgs, mode="tunnel", tunnel={"provider": "tailscale_funnel"})
+    r = await hgs.admin.post("/network/tunnel/start")
+    assert r.status_code == 400 and "tailscale.com/download" in r.json()["message"]

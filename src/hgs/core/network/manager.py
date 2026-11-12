@@ -25,6 +25,7 @@ from hgs.common.fileutil import atomic_write_json
 from hgs.core.config.settings import NetworkSettings, Settings
 
 from .tunnels.cloudflare import LIMITATIONS, CloudflareTunnel, find_cloudflared
+from .tunnels.tailscale import TailscaleFunnel, find_tailscale
 
 if TYPE_CHECKING:
     from hgs.core.app import CoreApp
@@ -123,7 +124,7 @@ class NetworkManager:
 
     def view(self) -> dict[str, Any]:
         n = self.settings
-        binary = find_cloudflared(n.tunnel.cloudflared_path, self.core.paths.root / "bin")
+        binary = self._binary()
         tunnel = self.tunnel.view() if self.tunnel else {
             "provider": n.tunnel.provider, "state": "stopped", "url": None, "error": None, "log_tail": [],
             "limitations": LIMITATIONS[n.tunnel.provider]}
@@ -200,9 +201,17 @@ class NetworkManager:
         self._changed()
 
     # == tunnel ====================================================================
+    def _binary(self) -> Path | None:
+        t = self.settings.tunnel
+        if t.provider == "tailscale_funnel":
+            return find_tailscale(t.tailscale_path)
+        return find_cloudflared(t.cloudflared_path, self.core.paths.root / "bin")
+
     def tunnel_command(self) -> list[str]:
-        binary = find_cloudflared(self.settings.tunnel.cloudflared_path, self.core.paths.root / "bin")
+        binary = self._binary()
         if binary is None:
+            if self.settings.tunnel.provider == "tailscale_funnel":
+                raise NetworkError("Tailscale не знайдено: встановіть його з tailscale.com/download і увійдіть в акаунт")
             raise NetworkError("cloudflared not found: download it on the Network page or set its path")
         return [str(binary)]
 
@@ -213,6 +222,11 @@ class NetworkManager:
             return
         t = self.settings.tunnel
         token = await self.core.secrets.get("cloudflare_tunnel_token") if t.provider == "cloudflare_named" else None
+        if t.provider == "tailscale_funnel":
+            self.tunnel = TailscaleFunnel(command=self.tunnel_command(), local_port=self.core.gateway_port,
+                                          on_change=self._changed)
+            await self.tunnel.start()
+            return
         self.tunnel = CloudflareTunnel(kind=t.provider, command=self.tunnel_command(), local_port=self.core.gateway_port,
                                        token=token, named_url=t.named_public_url, on_change=self._changed)
         await self.tunnel.start()
